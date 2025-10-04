@@ -22,13 +22,26 @@ SELECTORS = {
     "password": 'input[name="password"], input#password',
     "login_button": "button:has-text('Log in'), button:has-text('Iniciar sesión'), button[type=submit]",
     "symbol_input": "input[placeholder='Symbol'], input[aria-label='Symbol']",
-    "risk_dropdown": "[data-testid='risk-dropdown'], #risk, text=Risk, text=Riesgo",
-    "time_dropdown": "[data-testid='time-dropdown'], #time, text=Time, text=Hora",
+
+    # Riesgo y hora: soporta <select>, data-testid y texto
+    "risk_select": "select#risk, select[name='risk'], select[aria-label='Risk'], select:has(option)",
+    "risk_dropdown": "[data-testid='risk-dropdown'], text=Risk, text=Riesgo",
+
+    "time_select": "select#time, select[name='time'], select[aria-label='Time'], select:has(option)",
+    "time_dropdown": "[data-testid='time-dropdown'], text=Time, text=Hora",
+
     "download_btn": "text=Download CSV, button:has-text('Download CSV'), text=Descargar CSV",
 }
 
 KNOWN_RISKS = ["Conservative", "Intermediate", "Aggressive", "Ultra Aggressive"]
 
+# Map de valores/labels posibles en ES/EN
+RISK_VALUE_MAP = {
+    "Conservative": ["conservador", "conservative"],
+    "Intermediate": ["intermedio", "intermediate"],
+    "Aggressive": ["agresivo", "aggressive"],
+    "Ultra Aggressive": ["ultra agresivo", "ultra-aggressive", "ultra aggressive"],
+}
 
 # =========================
 # Utils
@@ -38,18 +51,10 @@ def ensure_dir(p: Path):
 
 def normalize_risk(r: str) -> str:
     m = r.strip().lower()
-    mapping = {
-        "conservador": "Conservative",
-        "conservative": "Conservative",
-        "intermedio": "Intermediate",
-        "intermediate": "Intermediate",
-        "agresivo": "Aggressive",
-        "aggressive": "Aggressive",
-        "ultra_agresivo": "Ultra Aggressive",
-        "ultra-aggressive": "Ultra Aggressive",
-        "ultra aggressive": "Ultra Aggressive",
-    }
-    return mapping.get(m, r.strip())
+    for k, vals in RISK_VALUE_MAP.items():
+        if m == k.lower() or any(m == v for v in vals):
+            return k
+    return r.strip()
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def click_hard(page, selector_or_text: str, by_text: bool = False):
@@ -60,7 +65,6 @@ def click_hard(page, selector_or_text: str, by_text: bool = False):
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def click_by_text_ci(page, text: str):
-    # Click por texto no exacto (case-insensitive)
     page.get_by_text(text, exact=False).first.click(timeout=12000)
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
@@ -71,18 +75,44 @@ def fill_hard(page, selector: str, value: str):
     loc.type(value)
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def select_from_dropdown(page, dropdown_selector: str, option_text: str):
-    # 1) Abre el dropdown
-    page.locator(dropdown_selector).first.click(timeout=8000)
-    # 2) Intenta como <select>
+def select_by_label_or_value(page, select_selector: str, wanted_label: str, alt_values: list[str]):
+    sel = page.locator(select_selector).first
+    # 1) por label visible (EN)
     try:
-        page.locator(dropdown_selector).first.select_option(label=option_text)
-        return
+        sel.select_option(label=wanted_label)
+        return True
     except Exception:
         pass
-    # 3) Intenta por texto visible (no exacto)
-    page.get_by_text(option_text, exact=False).first.click(timeout=12000)
-
+    # 2) por label visible (ES) – busca la opción dentro del mismo select
+    try:
+        for v in alt_values:
+            found = sel.locator(f"option:has-text('{v}')")
+            if found.count() > 0:
+                # intenta por value si existe, si no por label
+                opt_value = found.first.get_attribute("value")
+                if opt_value:
+                    sel.select_option(value=opt_value)
+                else:
+                    sel.select_option(label=v)
+                return True
+    except Exception:
+        pass
+    # 3) último intento: click en el dropdown y luego click por texto
+    try:
+        sel.click(timeout=6000)
+    except Exception:
+        pass
+    try:
+        click_by_text_ci(page, wanted_label)
+        return True
+    except Exception:
+        for v in alt_values:
+            try:
+                click_by_text_ci(page, v)
+                return True
+            except Exception:
+                continue
+    return False
 
 # =========================
 # Flujo principal
@@ -114,22 +144,45 @@ def scrape_all(page, symbol: str, risks: list[str], horarios: list[str], dashboa
         risk_dir = base_dir / risk_norm / today_str
         ensure_dir(risk_dir)
 
-        # Seleccionar riesgo
-        try:
-            select_from_dropdown(page, SELECTORS["risk_dropdown"], risk_norm)
-        except Exception:
-            click_by_text_ci(page, risk_norm)
+        # --- Seleccionar riesgo (select <option> no visible) ---
+        ok = select_by_label_or_value(
+            page,
+            SELECTORS["risk_select"],
+            risk_norm,
+            RISK_VALUE_MAP.get(risk_norm, []),
+        )
+        if not ok:
+            # intenta abrir dropdown "custom"
+            try:
+                click_hard(page, SELECTORS["risk_dropdown"])
+                click_by_text_ci(page, risk_norm)
+            except Exception:
+                # como último recurso intenta cualquiera de los alias
+                for alias in RISK_VALUE_MAP.get(risk_norm, []):
+                    try:
+                        click_by_text_ci(page, alias)
+                        break
+                    except Exception:
+                        continue
 
         for hhmm in horarios:
-            # Seleccionar horario
-            try:
-                select_from_dropdown(page, SELECTORS["time_dropdown"], hhmm)
-            except Exception:
-                click_by_text_ci(page, hhmm)
+            # --- Seleccionar horario ---
+            ok_t = select_by_label_or_value(
+                page,
+                SELECTORS["time_select"],
+                hhmm,
+                [hhmm],  # no hay alias
+            )
+            if not ok_t:
+                try:
+                    click_hard(page, SELECTORS["time_dropdown"])
+                    click_by_text_ci(page, hhmm)
+                except Exception:
+                    pass
 
+            # --- Descargar ---
             filename = f"{symbol}_{risk_norm}_{hhmm.replace(':','')}.csv"
             dest = risk_dir / filename
-
             try:
                 with page.expect_download(timeout=30000) as download_info:
                     click_hard(page, SELECTORS["download_btn"])
@@ -141,7 +194,6 @@ def scrape_all(page, symbol: str, risks: list[str], horarios: list[str], dashboa
             except Exception as e:
                 print(f"✖︎ Error al descargar {symbol}/{risk_norm}/{hhmm}: {e}")
             page.wait_for_timeout(400)
-
 
 def main():
     import argparse
@@ -161,7 +213,6 @@ def main():
         print("Faltan credenciales BTM_EMAIL / BTM_PASSWORD")
         sys.exit(1)
 
-    # Normaliza riesgos (acepta español/inglés)
     risks = [normalize_risk(r) for r in args.risks.split(",") if r.strip()]
     horarios = [h.strip() for h in args.horarios.split(",") if h.strip()]
 
@@ -178,7 +229,6 @@ def main():
 
         context.close()
         browser.close()
-
 
 if __name__ == "__main__":
     main()
