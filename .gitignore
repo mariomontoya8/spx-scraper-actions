@@ -6,12 +6,10 @@ __pycache__/
 .venv/
 .env
 
-
 # Playwright
 playwright-report/
 *.zip
 *.log
-
 
 # Data
 /data/*
