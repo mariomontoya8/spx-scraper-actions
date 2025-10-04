@@ -23,7 +23,7 @@ SELECTORS = {
     "download_btn": "text=Download CSV, button:has-text('Download CSV')",
 }
 
-KNOWN_RISKS = ["Conservative", "Intermediate", "Aggressive", "Ultra Aggressive"]
+KNOWN_RISKS = ["conservador", "intermedio", "agresivo", "ultra_agresivo"]
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
