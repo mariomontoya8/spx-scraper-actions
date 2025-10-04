@@ -1,0 +1,89 @@
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+import pytz
+from tenacity import retry, stop_after_attempt, wait_fixed
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+
+# --------------------------------------------
+# Utilería
+# --------------------------------------------
+TZ = os.getenv("TZ", "America/Monterrey")
+LOCAL_TZ = pytz.timezone(TZ)
+
+
+DEFAULT_LOGIN_URL = os.getenv("LOGIN_URL", "https://backtestingmarket.com/login")
+DEFAULT_DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://backtestingmarket.com/backtestingIdea")
+
+
+# Selectores de BTM (ajústalos si cambian)
+SELECTORS = {
+"email": 'input[name="email"], input#email',
+"password": 'input[name="password"], input#password',
+"login_button": "button:has-text('Log in'), button:has-text('Iniciar sesión'), button[type=submit]",
+# En el dashboard
+"symbol_input": "input[placeholder='Symbol'], input[aria-label='Symbol']",
+"risk_dropdown": "[data-testid='risk-dropdown'], #risk, text=Risk",
+"time_dropdown": "[data-testid='time-dropdown'], #time, text=Time",
+"download_btn": "text=Download CSV, button:has-text('Download CSV')",
+}
+
+
+KNOWN_RISKS = ["Conservative", "Intermediate", "Aggressive", "Ultra Aggressive"]
+
+
+# --------------------------------------------
+# Helpers robustos
+# --------------------------------------------
+
+
+def ensure_dir(p: Path):
+p.mkdir(parents=True, exist_ok=True)
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def click_hard(page, selector_or_text: str, by_text: bool = False):
+if by_text:
+page.get_by_text(selector_or_text, exact=True).click(timeout=8000)
+else:
+page.locator(selector_or_text).first.click(timeout=8000)
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def fill_hard(page, selector: str, value: str):
+loc = page.locator(selector).first
+loc.wait_for(state="visible", timeout=8000)
+loc.fill("")
+loc.type(value)
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def select_from_dropdown(page, dropdown_selector: str, option_text: str):
+page.locator(dropdown_selector).first.click(timeout=8000)
+page.get_by_text(option_text, exact=True).click(timeout=8000)
+
+
+# --------------------------------------------
+# Flujo principal
+# --------------------------------------------
+
+
+def login(page, email: str, password: str, login_url: str):
+page.goto(login_url, wait_until="load", timeout=60000)
+fill_hard(page, SELECTORS["email"], email)
+fill_hard(page, SELECTORS["password"], password)
+click_hard(page, SELECTORS["login_button"])
+page.wait_for_timeout(1500)
+
+
+
+
+def configure_symbol(page, symbol: str):
+try:
+fill_hard(page, SELECTORS["symbol_input"], symbol)
+page.keyboard.press("Enter")
+main()
