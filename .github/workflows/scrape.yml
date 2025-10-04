@@ -10,7 +10,7 @@ on:
       risks:
         description: "Riesgos separados por coma"
         required: false
-        default: "Conservative,Intermediate,Aggressive,Ultra Aggressive"
+        default: "conservador,intermedio,agresivo,ultra_agresivo"
       horarios:
         description: "Horarios HH:MM separados por coma"
         required: false
