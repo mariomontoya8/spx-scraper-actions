@@ -1,283 +1,260 @@
-import os
-import sys
-from datetime import datetime
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Scraper BackTestingMarket (Backtesting Idea) sin Playwright.
+
+- Login con CSRF.
+- Detecta horas y riesgos desde la UI.
+- Llama el endpoint JSON /backtestingIdea/get_backtesting_idea.
+- Guarda CSVs en data/<SYMBOL>/<Strategy>/<risk>/table_...csv
+- Escribe data/<SYMBOL>/<Strategy>/manifest.csv
+
+Requiere secrets:
+  BTM_EMAIL, BTM_PASSWORD
+"""
+
+from __future__ import annotations
+import os, re, time, argparse
 from pathlib import Path
+from typing import List, Iterable, Dict, Any
 
-import pytz
-from tenacity import retry, stop_after_attempt, wait_fixed
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
-# =========================
-# Config
-# =========================
-TZ = os.getenv("TZ", "America/Monterrey")
-LOCAL_TZ = pytz.timezone(TZ)
+BASE = os.getenv("BTM_BASE_URL", "https://backtestingmarket.com").rstrip("/")
+EMAIL = os.getenv("BTM_EMAIL")
+PASSWORD = os.getenv("BTM_PASSWORD")
 
-DEFAULT_LOGIN_URL = os.getenv("LOGIN_URL", "https://backtestingmarket.com/login")
-DEFAULT_DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://backtestingmarket.com/backtestingIdea")
+# Sesión HTTP
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36"
+})
 
-# Selectores (ajústalos si cambia la UI)
-SELECTORS = {
-    "email": 'input[name="email"], input#email',
-    "password": 'input[name="password"], input#password',
-    "login_button": "button:has-text('Log in'), button:has-text('Iniciar sesión'), button[type=submit]",
-    "symbol_input": "input[placeholder='Symbol'], input[aria-label='Symbol']",
+# ---------- Login (CSRF) ----------
+def _get_csrf_from_login() -> str | None:
+    r = session.get(urljoin(BASE, "/login"), timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    token = soup.find("input", {"name": "csrf_token"})
+    return token.get("value") if token else None
 
-    # Riesgo / hora: intenta primero <select>, luego “dropdown custom”
-    "risk_select": "select#risk, select[name='risk'], select[aria-label='Risk'], select:has(option)",
-    "risk_dropdown": "[data-testid='risk-dropdown'], text=Risk, text=Riesgo",
+def login(email: str, password: str) -> None:
+    if not email or not password:
+        raise RuntimeError("Faltan BTM_EMAIL/BTM_PASSWORD.")
+    csrf = _get_csrf_from_login()
+    if not csrf:
+        raise RuntimeError("No se encontró csrf_token en /login")
+    payload = {"email": email, "password": password, "csrf_token": csrf}
+    r = session.post(urljoin(BASE, "/login"), data=payload, allow_redirects=True, timeout=60)
+    r.raise_for_status()
+    chk = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
+    chk.raise_for_status()
+    print("✅ Login OK")
 
-    "time_select": "select#time, select[name='time'], select[aria-label='Time'], select:has(option)",
-    "time_dropdown": "[data-testid='time-dropdown'], text=Time, text=Hora",
+# ---------- Helpers ----------
+def normalize_time_hour(hora: str) -> str:
+    s = str(hora).strip().replace(":", "")
+    m = re.search(r"(\d{1,2})\D?(\d{2})", s)
+    return (m.group(1).zfill(2) + m.group(2)) if m else s.zfill(4)
 
-    # Botón/acción de descarga (más amplio)
-    "download_btn": (
-        "button:has-text('Download CSV'), text=Download CSV, "
-        "button:has-text('Export CSV'), text=Export CSV, "
-        "button:has-text('Exportar CSV'), text=Exportar CSV, "
-        "a:has-text('CSV'), button:has-text('CSV'), text=CSV"
-    ),
-    # Enlaces directos a .csv como plan B
-    "csv_link": "a[href$='.csv'], a[href*='.csv?']",
-}
+def get_timehour_options() -> List[str]:
+    r = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    values: List[str] = []
+    sel = soup.find(id="timeHour") or soup.find("select", {"name": "timeHour"})
+    if sel:
+        for opt in sel.find_all("option"):
+            t = (opt.text or "").strip()
+            if t and t.lower() != "selecciona una hora":
+                values.append(t)
+    # dedup
+    seen, out = set(), []
+    for v in values:
+        if v not in seen:
+            seen.add(v); out.append(v)
+    return out
 
-KNOWN_RISKS = ["Conservative", "Intermediate", "Aggressive", "Ultra Aggressive"]
+def get_risk_options() -> List[str]:
+    r = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    opts: List[str] = []
+    sel = soup.find(id="risk") or soup.find("select", {"name": "risk"})
+    if sel:
+        for opt in sel.find_all("option"):
+            val = (opt.get("value") or opt.text or "").strip()
+            if val and val.lower() not in {"selecciona", "selecciona un riesgo"}:
+                opts.append(val.strip().lower().replace(" ", "_"))
+    seen, out = set(), []
+    for v in opts:
+        if v not in seen:
+            seen.add(v); out.append(v)
+    return out
 
-RISK_VALUE_MAP = {
-    "Conservative": ["conservador", "conservative"],
-    "Intermediate": ["intermedio", "intermediate"],
-    "Aggressive": ["agresivo", "aggressive"],
-    "Ultra Aggressive": ["ultra agresivo", "ultra-aggressive", "ultra aggressive"],
-}
+def get_dates(symbol: str) -> List[str]:
+    r = session.get(urljoin(BASE, "/get_dates"), params={"symbol": symbol}, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    if isinstance(js, dict):
+        js = js.get("data", js)
+    return list(sorted(set(js)))
 
-# =========================
-# Utils
-# =========================
-def ensure_dir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
+# ---------- Descarga de una tabla ----------
+def fetch_table_csv(
+    symbol: str, desde: str, hasta: str, time_hhmm: str, strategy: str, risk: str,
+    out_dir: str, filename: str | None = None, clean_numeric: bool = True,
+    also_return_df: bool = False,
+):
+    hora_norm = normalize_time_hour(time_hhmm)
+    url = urljoin(BASE, "/backtestingIdea/get_backtesting_idea")
+    params = {
+        "desde": desde, "hasta": hasta, "symbol": symbol,
+        "estrategia": strategy, "hora": hora_norm, "risk": risk,
+    }
+    r = session.get(url, params=params, timeout=120)
+    r.raise_for_status()
 
-def normalize_risk(r: str) -> str:
-    m = r.strip().lower()
-    for k, vals in RISK_VALUE_MAP.items():
-        if m == k.lower() or any(m == v for v in vals):
-            return k
-    return r.strip()
+    payload = r.json()
+    rows = payload.get("data", payload if isinstance(payload, list) else [])
+    if not isinstance(rows, list):
+        raise RuntimeError(f"Respuesta inesperada: {type(rows)}")
+    if not rows:
+        return None if not also_return_df else pd.DataFrame()
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def fill_hard(page, selector: str, value: str):
-    loc = page.locator(selector).first
-    loc.wait_for(state="visible", timeout=8000)
-    loc.fill("")
-    loc.type(value)
+    df = pd.DataFrame(rows)
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def click_hard(page, selector_or_text: str, by_text: bool = False, timeout: int = 8000):
-    if by_text:
-        page.get_by_text(selector_or_text, exact=True).click(timeout=timeout)
-    else:
-        loc = page.locator(selector_or_text).first
-        loc.scroll_into_view_if_needed(timeout=timeout)
-        loc.click(timeout=timeout)
+    rename_map = {
+        "fecha": "Date", "date": "Date",
+        "hora": "Time", "time": "Time",
+        "strikes": "Strikes", "type": "Type",
+        "credit": "Credit", "price": "Price", "close": "Close",
+        "result": "Result", "strike_distance": "Strike Distance", "moneyness": "Moneyness",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def click_by_text_ci(page, text: str, timeout: int = 12000):
-    loc = page.get_by_text(text, exact=False).first
-    loc.scroll_into_view_if_needed(timeout=timeout)
-    loc.click(timeout=timeout)
+    if clean_numeric:
+        def clean_money(x):
+            return pd.to_numeric(str(x).replace("$", "").replace(",", "").strip(), errors="coerce")
+        for c in ["Credit", "Price", "Close", "Result", "Strike Distance", "Moneyness"]:
+            if c in df.columns:
+                df[c] = df[c].map(clean_money)
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def select_by_label_or_value(page, select_selector: str, wanted_label: str, alt_values: list[str]):
-    sel = page.locator(select_selector).first
-    try:
-        sel.select_option(label=wanted_label)
-        return True
-    except Exception:
-        pass
-    try:
-        for v in alt_values:
-            found = sel.locator(f"option:has-text('{v}')")
-            if found.count() > 0:
-                opt_value = found.first.get_attribute("value")
-                if opt_value:
-                    sel.select_option(value=opt_value)
-                else:
-                    sel.select_option(label=v)
-                return True
-    except Exception:
-        pass
-    try:
-        sel.click(timeout=6000)
-    except Exception:
-        pass
-    try:
-        click_by_text_ci(page, wanted_label)
-        return True
-    except Exception:
-        for v in alt_values:
-            try:
-                click_by_text_ci(page, v)
-                return True
-            except Exception:
-                continue
-    return False
+    out_path = Path(out_dir); out_path.mkdir(parents=True, exist_ok=True)
+    if filename is None:
+        safe_risk = re.sub(r"\s+", "", str(risk))
+        safe_strategy = re.sub(r"\s+", "", str(strategy))
+        hora_norm = normalize_time_hour(time_hhmm)
+        filename = f"table_{symbol}_{safe_strategy}_{safe_risk}_{hora_norm}_{desde}_{hasta}.csv"
 
-def download_csv_resilient(page, dest: Path) -> bool:
-    """
-    Intenta 1) expect_download con botones conocidos,
-            2) click alternativo por texto,
-            3) buscar <a href='...csv'> y descargarlo con fetch dentro de la página.
-    """
-    # 1) Botón conocido + expect_download
-    btn = page.locator(SELECTORS["download_btn"]).first
-    try:
-        btn.scroll_into_view_if_needed(timeout=6000)
-        with page.expect_download(timeout=20000) as dl_info:
-            btn.click(timeout=12000)
-        download = dl_info.value
-        download.save_as(str(dest))
-        return True
-    except Exception:
-        pass
+    csv_file = out_path / filename
+    df.to_csv(csv_file, index=False, encoding="utf-8")
+    print(f"💾 CSV guardado: {csv_file} | Filas: {len(df)}")
+    return df if also_return_df else None
 
-    # 2) Alternativa: click por texto “CSV”
-    try:
-        with page.expect_download(timeout=20000) as dl_info:
-            click_by_text_ci(page, "CSV", timeout=12000)
-        download = dl_info.value
-        download.save_as(str(dest))
-        return True
-    except Exception:
-        pass
+# ---------- Descarga masiva ----------
+def bulk_download_tables(
+    symbol: str, strategy: str, desde: str | None, hasta: str | None,
+    hours: Iterable[str] | None, risks: Iterable[str] | None,
+    out_base: str = "data", pause_s: float = 0.1, overwrite: bool = False,
+) -> pd.DataFrame:
+    if not desde or not hasta:
+        dates = get_dates(symbol)
+        if not dates:
+            raise RuntimeError("No se pudieron obtener fechas con /get_dates.")
+        desde, hasta = dates[0], dates[-1]
+        print(f"🗓️  Rango auto: {desde} → {hasta}")
 
-    # 3) Buscar enlace .csv y “descargar” vía fetch en el contexto de la página
-    try:
-        link = page.locator(SELECTORS["csv_link"]).first
-        if link.count() > 0:
-            href = link.get_attribute("href")
-            if href:
-                # Traemos el CSV desde la propia página (evita CORS en el runner)
-                csv_text = page.evaluate(
-                    """async (url) => {
-                        const r = await fetch(url, { credentials: 'include' });
-                        if (!r.ok) throw new Error('HTTP ' + r.status);
-                        return await r.text();
-                    }""",
-                    href,
-                )
-                dest.write_text(csv_text, encoding="utf-8")
-                return True
-    except Exception:
-        pass
+    if hours is None or (isinstance(hours, str) and hours.strip().lower() in {"", "auto", "all"}):
+        hours = get_timehour_options()
+    if risks is None or (isinstance(risks, str) and risks.strip().lower() in {"", "auto", "all"}):
+        risks = get_risk_options()
 
-    return False
+    hours = list(hours)
+    risks = [str(r).strip().lower().replace(" ", "_") for r in risks]
 
-# =========================
-# Flujo principal
-# =========================
-def login(page, email: str, password: str, login_url: str):
-    page.goto(login_url, wait_until="load", timeout=60000)
-    fill_hard(page, SELECTORS["email"], email)
-    fill_hard(page, SELECTORS["password"], password)
-    click_hard(page, SELECTORS["login_button"])
-    page.wait_for_timeout(1500)
+    base = Path(out_base) / symbol / strategy
+    base.mkdir(parents=True, exist_ok=True)
 
-def configure_symbol(page, symbol: str):
-    try:
-        fill_hard(page, SELECTORS["symbol_input"], symbol)
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(600)
-    except Exception:
-        pass
-
-def scrape_all(page, symbol: str, risks: list[str], horarios: list[str], dashboard_url: str, out_root: Path):
-    page.goto(dashboard_url, wait_until="networkidle", timeout=60000)
-    configure_symbol(page, symbol)
-
-    today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
-    base_dir = out_root / symbol
+    manifest: List[Dict[str, Any]] = []
+    total_done = total_empty = total_skipped = 0
 
     for risk in risks:
-        risk_norm = normalize_risk(risk)
-        risk_dir = base_dir / risk_norm / today_str
-        ensure_dir(risk_dir)
+        risk_dir = base / risk
+        risk_dir.mkdir(parents=True, exist_ok=True)
 
-        # Seleccionar riesgo
-        ok = select_by_label_or_value(page, SELECTORS["risk_select"], risk_norm, RISK_VALUE_MAP.get(risk_norm, []))
-        if not ok:
+        for hour in hours:
+            hhmm = normalize_time_hour(hour)
+            fname = f"table_{symbol}_{strategy}_{risk}_{hhmm}_{desde}_{hasta}.csv"
+            fpath = risk_dir / fname
+
+            if fpath.exists() and not overwrite:
+                total_skipped += 1
+                print(f"⏭️  Ya existe, salto: {fpath.name}")
+                manifest.append({"risk": risk, "hour": hhmm, "file": str(fpath), "rows": None, "status": "skipped"})
+                continue
+
             try:
-                click_hard(page, SELECTORS["risk_dropdown"])
-                click_by_text_ci(page, risk_norm)
-            except Exception:
-                for alias in RISK_VALUE_MAP.get(risk_norm, []):
-                    try:
-                        click_by_text_ci(page, alias)
-                        break
-                    except Exception:
-                        continue
-
-        for hhmm in horarios:
-            # Seleccionar horario
-            ok_t = select_by_label_or_value(page, SELECTORS["time_select"], hhmm, [hhmm])
-            if not ok_t:
-                try:
-                    click_hard(page, SELECTORS["time_dropdown"])
-                    click_by_text_ci(page, hhmm)
-                except Exception:
-                    pass
-
-            # Pequeña espera para que la grilla/serie se regenere
-            page.wait_for_load_state("networkidle")
-            page.wait_for_timeout(600)
-
-            filename = f"{symbol}_{risk_norm}_{hhmm.replace(':','')}.csv"
-            dest = risk_dir / filename
-
-            # Descargar
-            try:
-                ok_dl = download_csv_resilient(page, dest)
-                if ok_dl:
-                    print(f"✔︎ Guardado: {dest}")
+                df = fetch_table_csv(
+                    symbol=symbol, desde=desde, hasta=hasta,
+                    time_hhmm=hhmm, strategy=strategy, risk=risk,
+                    out_dir=str(risk_dir), filename=fname, also_return_df=True
+                )
+                rows = 0 if df is None else int(len(df))
+                if df is None or rows == 0:
+                    total_empty += 1
+                    print(f"⚠️  Vacío: {risk:<16} {hhmm} -> {fname}")
+                    manifest.append({"risk": risk, "hour": hhmm, "file": str(fpath), "rows": 0, "status": "empty"})
                 else:
-                    print(f"* Error al descargar {symbol}/{risk_norm}/{hhmm}: no se encontró botón/enlace CSV")
+                    total_done += 1
+                    manifest.append({"risk": risk, "hour": hhmm, "file": str(fpath), "rows": rows, "status": "ok"})
+                    print(f"✅ {risk:<16} {hhmm}: {rows:>4} filas -> {fname}")
             except Exception as e:
-                print(f"* Error al descargar {symbol}/{risk_norm}/{hhmm}: {e}")
+                print(f"❌ Error {risk} {hhmm}: {e}")
+                manifest.append({"risk": risk, "hour": hhmm, "file": str(fpath), "rows": 0, "status": f"error:{e}"})
+            finally:
+                time.sleep(pause_s)
 
-            page.wait_for_timeout(400)
+    man_df = pd.DataFrame(manifest)
+    man_df.to_csv(base / "manifest.csv", index=False)
+    print("\nResumen:")
+    print(f"  OK: {total_done}  | Vacíos: {total_empty}  | Saltados: {total_skipped}")
+    print(f"  Manifest: {base / 'manifest.csv'}")
+    return man_df
+
+# ---------- CLI ----------
+def parse_args():
+    p = argparse.ArgumentParser(description="Descarga masiva Backtesting Idea (sin navegador)")
+    p.add_argument("--symbol", default=os.getenv("SYMBOL", "SPX"))
+    p.add_argument("--strategy", default=os.getenv("STRATEGY", "Vertical"))
+    p.add_argument("--desde", default=os.getenv("DESDE", ""))
+    p.add_argument("--hasta", default=os.getenv("HASTA", ""))
+    p.add_argument("--risks", default=os.getenv("RISKS", "auto"),
+                   help="CSV: conservador,intermedio,agresivo,ultra_agresivo | 'auto'")
+    p.add_argument("--hours", default=os.getenv("HORARIOS", "auto"),
+                   help="CSV: 09:40,10:00,... | 'auto'")
+    p.add_argument("--out-base", default=os.getenv("OUT_BASE", "data"))
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--pause", type=float, default=float(os.getenv("PAUSE_S", "0.10")))
+    return p.parse_args()
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Scraper BTM CSVs con Playwright")
-    parser.add_argument("--symbol", default=os.getenv("SYMBOL", "SPX"))
-    parser.add_argument("--risks", default=os.getenv("RISKS", ",".join(KNOWN_RISKS)))
-    parser.add_argument("--horarios", default=os.getenv("HORARIOS",
-        "09:40,10:00,10:20,10:40,11:00,11:20,11:30,12:00,12:20,12:40,13:00,13:20,13:40,14:00,14:20,14:40,15:00"))
-    parser.add_argument("--login-url", default=DEFAULT_LOGIN_URL)
-    parser.add_argument("--dashboard-url", default=DEFAULT_DASHBOARD_URL)
-    parser.add_argument("--out", default="data")
-    args = parser.parse_args()
+    args = parse_args()
+    print(f"▶️  Run SYMBOL={args.symbol}  STRATEGY={args.strategy}")
+    login(EMAIL, PASSWORD)
 
-    email = os.getenv("BTM_EMAIL")
-    password = os.getenv("BTM_PASSWORD")
-    if not email or not password:
-        print("Faltan credenciales BTM_EMAIL / BTM_PASSWORD")
-        sys.exit(1)
+    hours = None if args.hours.strip().lower() in {"", "auto", "all"} else [h.strip() for h in args.hours.split(",") if h.strip()]
+    risks = None if args.risks.strip().lower() in {"", "auto", "all"} else [r.strip() for r in args.risks.split(",") if r.strip()]
 
-    risks = [normalize_risk(r) for r in args.risks.split(",") if r.strip()]
-    horarios = [h.strip() for h in args.horarios.split(",") if h.strip()]
-
-    out_root = Path(args.out)
-    ensure_dir(out_root)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(accept_downloads=True, timezone_id=TZ)
-        page = context.new_page()
-
-        login(page, email, password, args.login_url)
-        scrape_all(page, args.symbol, risks, horarios, args.dashboard_url, out_root)
-
-        context.close()
-        browser.close()
+    bulk_download_tables(
+        symbol=args.symbol, strategy=args.strategy,
+        desde=args.desde or None, hasta=args.hasta or None,
+        hours=hours, risks=risks, out_base=args.out_base,
+        pause_s=args.pause, overwrite=args.overwrite
+    )
 
 if __name__ == "__main__":
     main()
