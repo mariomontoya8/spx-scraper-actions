@@ -11,14 +11,6 @@ on:
         description: "Estrategia (Vertical o IronCondor)"
         required: true
         default: "Vertical"
-      riesgos:
-        description: "Riesgos (conservador,intermedio,agresivo,ultra_agresivo) — vacío = auto"
-        required: false
-        default: "conservador,intermedio,agresivo,ultra_agresivo"
-      horarios:
-        description: "Horarios HH:MM (09:40,10:00,...) — vacío = auto"
-        required: false
-        default: "10:05,10:10,10:15,10:20,10:25,10:30,10:35,10:40,10:45,10:50,10:55,11:00,11:05,11:10,11:15,11:20,11:25,11:30,11:35,11:40,11:45,11:50,11:55,12:00,12:05,12:10,12:15,12:20,12:25,12:30,12:35,12:40,12:45,12:50,12:55,13:00,13:05,13:10,13:15,13:20,13:25,13:30,13:35,13:40,13:45,13:50,13:55,14:00,14:05,14:10,14:15,14:20,14:25,14:30,14:35,14:40,14:45,14:50,14:55,15:00,15:05,15:10,15:15,15:20,15:25"
       desde:
         description: "YYYY-MM-DD — vacío = rango auto"
         required: false
@@ -27,7 +19,7 @@ on:
         description: "YYYY-MM-DD — vacío = rango auto"
         required: false
         default: ""
-        
+
 permissions:
   contents: write
 
@@ -35,9 +27,19 @@ env:
   TZ: America/Monterrey
 
 jobs:
+  # Ejecuta en paralelo por riesgo y por bloques de horarios (para no exceder el tiempo)
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        risk: [conservador, intermedio, agresivo, ultra_agresivo]
+        hours_chunk:
+          - "10:05,10:10,10:15,10:20,10:25,10:30,10:35,10:40,10:45,10:50,10:55,11:00,11:05,11:10,11:15,11:20,11:25"
+          - "11:30,11:35,11:40,11:45,11:50,11:55,12:00,12:05,12:10,12:15,12:20,12:25,12:30,12:35,12:40,12:45,12:50,12:55"
+          - "13:00,13:05,13:10,13:15,13:20,13:25,13:30,13:35,13:40,13:45,13:50,13:55,14:00,14:05,14:10,14:15,14:20,14:25"
+          - "14:30,14:35,14:40,14:45,14:50,14:55,15:00,15:05,15:10,15:15,15:20,15:25"
 
     steps:
       - name: Checkout
@@ -53,7 +55,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Run chunk
         env:
           BTM_EMAIL: ${{ secrets.BTM_EMAIL }}
           BTM_PASSWORD: ${{ secrets.BTM_PASSWORD }}
@@ -61,28 +63,57 @@ jobs:
           python scraper/btm_scraper.py \
             --symbol "${{ inputs.symbol }}" \
             --strategy "${{ inputs.strategy }}" \
-            --risks "${{ inputs.riesgos }}" \
-            --hours "${{ inputs.horarios }}" \
+            --risks "${{ matrix.risk }}" \
+            --hours "${{ matrix.hours_chunk }}" \
             --desde "${{ inputs.desde }}" \
             --hasta "${{ inputs.hasta }}" \
-            --out-base "data"
+            --out-base "data" \
+            --pause 0.05
 
-      - name: Commit & push data
+      - name: Upload CSVs (per-chunk)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "data-${{ matrix.risk }}-${{ strategy.job-index }}"
+          path: data/
+          if-no-files-found: warn
+
+  # Junta todos los artifacts y hace un único commit con todo data/
+  assemble-and-commit:
+    needs: scrape
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./_artifacts
+
+      - name: Merge data folders
+        run: |
+          mkdir -p data
+          # copiar todo el contenido de artifacts a data/
+          shopt -s globstar nullglob
+          for f in _artifacts/**/data/**; do
+            if [ -f "$f" ]; then
+              dest="data/${f#*_artifacts/}"
+              dest_dir="$(dirname "$dest")"
+              mkdir -p "$dest_dir"
+              cp -f "$f" "$dest"
+            fi
+          done
+
+      - name: Commit & push data (single commit)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if [[ -n $(git status --porcelain) ]]; then
             git add -A
-            git commit -m "chore(data): update CSVs [skip ci]"
+            git commit -m "chore(data): update CSVs (matrix merge) [skip ci]"
             git push
           else
             echo "No hay cambios para commitear."
           fi
-
-      - name: Upload CSVs as artifact (optional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: data-csvs
-          path: data/
-          if-no-files-found: warn
