@@ -23,19 +23,26 @@ SELECTORS = {
     "login_button": "button:has-text('Log in'), button:has-text('Iniciar sesión'), button[type=submit]",
     "symbol_input": "input[placeholder='Symbol'], input[aria-label='Symbol']",
 
-    # Riesgo y hora: soporta <select>, data-testid y texto
+    # Riesgo / hora: intenta primero <select>, luego “dropdown custom”
     "risk_select": "select#risk, select[name='risk'], select[aria-label='Risk'], select:has(option)",
     "risk_dropdown": "[data-testid='risk-dropdown'], text=Risk, text=Riesgo",
 
     "time_select": "select#time, select[name='time'], select[aria-label='Time'], select:has(option)",
     "time_dropdown": "[data-testid='time-dropdown'], text=Time, text=Hora",
 
-    "download_btn": "text=Download CSV, button:has-text('Download CSV'), text=Descargar CSV",
+    # Botón/acción de descarga (más amplio)
+    "download_btn": (
+        "button:has-text('Download CSV'), text=Download CSV, "
+        "button:has-text('Export CSV'), text=Export CSV, "
+        "button:has-text('Exportar CSV'), text=Exportar CSV, "
+        "a:has-text('CSV'), button:has-text('CSV'), text=CSV"
+    ),
+    # Enlaces directos a .csv como plan B
+    "csv_link": "a[href$='.csv'], a[href*='.csv?']",
 }
 
 KNOWN_RISKS = ["Conservative", "Intermediate", "Aggressive", "Ultra Aggressive"]
 
-# Map de valores/labels posibles en ES/EN
 RISK_VALUE_MAP = {
     "Conservative": ["conservador", "conservative"],
     "Intermediate": ["intermedio", "intermediate"],
@@ -57,17 +64,6 @@ def normalize_risk(r: str) -> str:
     return r.strip()
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def click_hard(page, selector_or_text: str, by_text: bool = False):
-    if by_text:
-        page.get_by_text(selector_or_text, exact=True).click(timeout=8000)
-    else:
-        page.locator(selector_or_text).first.click(timeout=8000)
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def click_by_text_ci(page, text: str):
-    page.get_by_text(text, exact=False).first.click(timeout=12000)
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def fill_hard(page, selector: str, value: str):
     loc = page.locator(selector).first
     loc.wait_for(state="visible", timeout=8000)
@@ -75,20 +71,32 @@ def fill_hard(page, selector: str, value: str):
     loc.type(value)
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def click_hard(page, selector_or_text: str, by_text: bool = False, timeout: int = 8000):
+    if by_text:
+        page.get_by_text(selector_or_text, exact=True).click(timeout=timeout)
+    else:
+        loc = page.locator(selector_or_text).first
+        loc.scroll_into_view_if_needed(timeout=timeout)
+        loc.click(timeout=timeout)
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def click_by_text_ci(page, text: str, timeout: int = 12000):
+    loc = page.get_by_text(text, exact=False).first
+    loc.scroll_into_view_if_needed(timeout=timeout)
+    loc.click(timeout=timeout)
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def select_by_label_or_value(page, select_selector: str, wanted_label: str, alt_values: list[str]):
     sel = page.locator(select_selector).first
-    # 1) por label visible (EN)
     try:
         sel.select_option(label=wanted_label)
         return True
     except Exception:
         pass
-    # 2) por label visible (ES) – busca la opción dentro del mismo select
     try:
         for v in alt_values:
             found = sel.locator(f"option:has-text('{v}')")
             if found.count() > 0:
-                # intenta por value si existe, si no por label
                 opt_value = found.first.get_attribute("value")
                 if opt_value:
                     sel.select_option(value=opt_value)
@@ -97,7 +105,6 @@ def select_by_label_or_value(page, select_selector: str, wanted_label: str, alt_
                 return True
     except Exception:
         pass
-    # 3) último intento: click en el dropdown y luego click por texto
     try:
         sel.click(timeout=6000)
     except Exception:
@@ -114,6 +121,56 @@ def select_by_label_or_value(page, select_selector: str, wanted_label: str, alt_
                 continue
     return False
 
+def download_csv_resilient(page, dest: Path) -> bool:
+    """
+    Intenta 1) expect_download con botones conocidos,
+            2) click alternativo por texto,
+            3) buscar <a href='...csv'> y descargarlo con fetch dentro de la página.
+    """
+    # 1) Botón conocido + expect_download
+    btn = page.locator(SELECTORS["download_btn"]).first
+    try:
+        btn.scroll_into_view_if_needed(timeout=6000)
+        with page.expect_download(timeout=20000) as dl_info:
+            btn.click(timeout=12000)
+        download = dl_info.value
+        download.save_as(str(dest))
+        return True
+    except Exception:
+        pass
+
+    # 2) Alternativa: click por texto “CSV”
+    try:
+        with page.expect_download(timeout=20000) as dl_info:
+            click_by_text_ci(page, "CSV", timeout=12000)
+        download = dl_info.value
+        download.save_as(str(dest))
+        return True
+    except Exception:
+        pass
+
+    # 3) Buscar enlace .csv y “descargar” vía fetch en el contexto de la página
+    try:
+        link = page.locator(SELECTORS["csv_link"]).first
+        if link.count() > 0:
+            href = link.get_attribute("href")
+            if href:
+                # Traemos el CSV desde la propia página (evita CORS en el runner)
+                csv_text = page.evaluate(
+                    """async (url) => {
+                        const r = await fetch(url, { credentials: 'include' });
+                        if (!r.ok) throw new Error('HTTP ' + r.status);
+                        return await r.text();
+                    }""",
+                    href,
+                )
+                dest.write_text(csv_text, encoding="utf-8")
+                return True
+    except Exception:
+        pass
+
+    return False
+
 # =========================
 # Flujo principal
 # =========================
@@ -128,7 +185,7 @@ def configure_symbol(page, symbol: str):
     try:
         fill_hard(page, SELECTORS["symbol_input"], symbol)
         page.keyboard.press("Enter")
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(600)
     except Exception:
         pass
 
@@ -144,20 +201,13 @@ def scrape_all(page, symbol: str, risks: list[str], horarios: list[str], dashboa
         risk_dir = base_dir / risk_norm / today_str
         ensure_dir(risk_dir)
 
-        # --- Seleccionar riesgo (select <option> no visible) ---
-        ok = select_by_label_or_value(
-            page,
-            SELECTORS["risk_select"],
-            risk_norm,
-            RISK_VALUE_MAP.get(risk_norm, []),
-        )
+        # Seleccionar riesgo
+        ok = select_by_label_or_value(page, SELECTORS["risk_select"], risk_norm, RISK_VALUE_MAP.get(risk_norm, []))
         if not ok:
-            # intenta abrir dropdown "custom"
             try:
                 click_hard(page, SELECTORS["risk_dropdown"])
                 click_by_text_ci(page, risk_norm)
             except Exception:
-                # como último recurso intenta cualquiera de los alias
                 for alias in RISK_VALUE_MAP.get(risk_norm, []):
                     try:
                         click_by_text_ci(page, alias)
@@ -166,13 +216,8 @@ def scrape_all(page, symbol: str, risks: list[str], horarios: list[str], dashboa
                         continue
 
         for hhmm in horarios:
-            # --- Seleccionar horario ---
-            ok_t = select_by_label_or_value(
-                page,
-                SELECTORS["time_select"],
-                hhmm,
-                [hhmm],  # no hay alias
-            )
+            # Seleccionar horario
+            ok_t = select_by_label_or_value(page, SELECTORS["time_select"], hhmm, [hhmm])
             if not ok_t:
                 try:
                     click_hard(page, SELECTORS["time_dropdown"])
@@ -180,19 +225,23 @@ def scrape_all(page, symbol: str, risks: list[str], horarios: list[str], dashboa
                 except Exception:
                     pass
 
-            # --- Descargar ---
+            # Pequeña espera para que la grilla/serie se regenere
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(600)
+
             filename = f"{symbol}_{risk_norm}_{hhmm.replace(':','')}.csv"
             dest = risk_dir / filename
+
+            # Descargar
             try:
-                with page.expect_download(timeout=30000) as download_info:
-                    click_hard(page, SELECTORS["download_btn"])
-                download = download_info.value
-                download.save_as(str(dest))
-                print(f"✔︎ Guardado: {dest}")
-            except PWTimeout:
-                print(f"✖︎ Timeout al descargar {symbol}/{risk_norm}/{hhmm}")
+                ok_dl = download_csv_resilient(page, dest)
+                if ok_dl:
+                    print(f"✔︎ Guardado: {dest}")
+                else:
+                    print(f"* Error al descargar {symbol}/{risk_norm}/{hhmm}: no se encontró botón/enlace CSV")
             except Exception as e:
-                print(f"✖︎ Error al descargar {symbol}/{risk_norm}/{hhmm}: {e}")
+                print(f"* Error al descargar {symbol}/{risk_norm}/{hhmm}: {e}")
+
             page.wait_for_timeout(400)
 
 def main():
