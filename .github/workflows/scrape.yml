@@ -89,7 +89,7 @@ jobs:
           path: data/
           if-no-files-found: warn
 
-      # ---------- OneDrive sync (rclone) ----------
+      # ---------- RCLONE A SHAREPOINT ----------
       - name: Install rclone
         if: always()
         run: |
@@ -102,17 +102,14 @@ jobs:
           RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
         run: |
           mkdir -p ~/.config/rclone
-          # importante: dejar salto de línea final
           printf "%s\n" "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
           echo "Remotos configurados:"
           rclone listremotes || true
 
-      - name: Sync data/ to OneDrive
+      - name: Sync data/ to SharePoint work (PowerBI/SPX-Scraper)
         if: always()
-        env:
-          RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
         run: |
-          REMOTE="${RCLONE_REMOTE_NAME:-onedrive_personal}"
+          REMOTE="sharepoint_work"
           DEST="$REMOTE:PowerBI/SPX-Scraper/"
           echo "Validando remote: $REMOTE"
           if ! rclone listremotes | grep -q "^${REMOTE}:" ; then
@@ -124,7 +121,7 @@ jobs:
             --update --fast-list --checkers 8 --transfers 8 \
             --create-empty-src-dirs -v
 
-      # ---------- Notificación por correo ----------
+      # ---------- NOTIFICACIÓN POR CORREO ----------
       - name: Send email notification
         if: always()
         uses: dawidd6/action-send-mail@v3
@@ -143,7 +140,7 @@ jobs:
             Repo:            ${{ github.repository }}
             Run:             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            Subida a OneDrive: ${RCLONE_REMOTE_NAME:-onedrive_personal}:/PowerBI/SPX-Scraper/
+            Subida a SharePoint: sharepoint_work:/PowerBI/SPX-Scraper/
             Parámetros:
               - symbol:   ${{ inputs.symbol }}
               - strategy: ${{ inputs.strategy }}
