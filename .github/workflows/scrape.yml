@@ -37,7 +37,7 @@ env:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 horas
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -102,17 +102,24 @@ jobs:
           RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
         run: |
           mkdir -p ~/.config/rclone
-          # Escribimos el contenido del secreto tal cual (incluye [onedrive_personal] ...)
-          printf "%s" "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
+          # importante: dejar salto de línea final
+          printf "%s\n" "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
           echo "Remotos configurados:"
           rclone listremotes || true
 
-      - name: Sync data/ to OneDrive (onedrive_personal:PowerBI/SPX-Scraper/)
+      - name: Sync data/ to OneDrive
         if: always()
+        env:
+          RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
         run: |
-          DEST="onedrive_personal:PowerBI/SPX-Scraper/"
+          REMOTE="${RCLONE_REMOTE_NAME:-onedrive_personal}"
+          DEST="$REMOTE:PowerBI/SPX-Scraper/"
+          echo "Validando remote: $REMOTE"
+          if ! rclone listremotes | grep -q "^${REMOTE}:" ; then
+            echo "::error::El remote '${REMOTE}' no existe en rclone.conf. Revisa el secreto RCLONE_CONFIG (debe contener [${REMOTE}] …)."
+            exit 1
+          fi
           echo "Subiendo CSVs a: $DEST"
-          # --update evita re-subir iguales, --fast-list acelera listado
           rclone copy "data/" "$DEST" \
             --update --fast-list --checkers 8 --transfers 8 \
             --create-empty-src-dirs -v
@@ -122,8 +129,8 @@ jobs:
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
-          server: ${{ secrets.SMTP_SERVER }}
-          port: ${{ secrets.SMTP_PORT }}
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
           secure: true
@@ -136,7 +143,7 @@ jobs:
             Repo:            ${{ github.repository }}
             Run:             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-            Subida a OneDrive: onedrive_personal:/PowerBI/SPX-Scraper/
+            Subida a OneDrive: ${RCLONE_REMOTE_NAME:-onedrive_personal}:/PowerBI/SPX-Scraper/
             Parámetros:
               - symbol:   ${{ inputs.symbol }}
               - strategy: ${{ inputs.strategy }}
