@@ -11,33 +11,39 @@ on:
         description: "Estrategia (Vertical o IronCondor)"
         required: true
         default: "Vertical"
-      riesgos:
-        description: "Riesgos (conservador,intermedio,agresivo,ultra_agresivo) — vacío = auto"
-        required: false
-        default: "conservador,intermedio,agresivo,ultra_agresivo"
-      horarios:
-        description: "Horarios HH:MM — vacío = auto"
-        required: false
-        default: "10:05,10:10,10:15,10:20,10:25,10:30,10:35,10:40,10:45,10:50,10:55,11:00,11:05,11:10,11:15,11:20,11:25,11:30,11:35,11:40,11:45,11:50,11:55,12:00,12:05,12:10,12:15,12:20,12:25,12:30,12:35,12:40,12:45,12:50,12:55,13:00,13:05,13:10,13:15,13:20,13:25,13:30,13:35,13:40,13:45,13:50,13:55,14:00,14:05,14:10,14:15,14:20,14:25,14:30,14:35,14:40,14:45,14:50,14:55,15:00,15:05,15:10,15:15,15:20,15:25"
-      desde:
-        description: "YYYY-MM-DD — vacío = rango auto"
+      risks:
+        description: "Riesgos (conservador,intermedio,agresivo,ultra_agresivo) vacío = auto"
         required: false
         default: ""
-      hasta:
-        description: "YYYY-MM-DD — vacío = rango auto"
+      horarios:
+        description: "Horarios HH:MM separados por coma (vacío = auto)"
+        required: false
+        default: ""
+      date_from:
+        description: "YYYY-MM-DD (vacío = rango auto)"
+        required: false
+        default: ""
+      date_to:
+        description: "YYYY-MM-DD (vacío = rango auto)"
         required: false
         default: ""
 
 permissions:
   contents: write
 
-env:
-  TZ: America/Monterrey
+concurrency:
+  group: scrape-btm
+  cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+
+    env:
+      PYTHONUTF8: "1"
+      TZ: America/Monterrey
+      PLAYWRIGHT_BROWSERS_PATH: 0
 
     steps:
       - name: Checkout
@@ -46,54 +52,59 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -c "import playwright; playwright.__dict__" || true
+          python -m playwright install --with-deps chromium
 
       - name: Run scraper
         env:
+          SYMBOL: ${{ github.event.inputs.symbol }}
+          STRATEGY: ${{ github.event.inputs.strategy }}
+          RIESGOS: ${{ github.event.inputs.risks }}
+          HORARIOS: ${{ github.event.inputs.horarios }}
+          DATE_FROM: ${{ github.event.inputs.date_from }}
+          DATE_TO: ${{ github.event.inputs.date_to }}
+          # URLs ya configuradas como variables de repo opcionalmente:
+          DASHBOARD_URL: ${{ vars.DASHBOARD_URL }}
+          LOGIN_URL: ${{ vars.LOGIN_URL }}
           BTM_EMAIL: ${{ secrets.BTM_EMAIL }}
           BTM_PASSWORD: ${{ secrets.BTM_PASSWORD }}
         run: |
-          set -e
+          echo "Ejecutando scraper..."
           python scraper/btm_scraper.py \
-            --symbol "${{ inputs.symbol }}" \
-            --strategy "${{ inputs.strategy }}" \
-            --risks "${{ inputs.riesgos }}" \
-            --hours "${{ inputs.horarios }}" \
-            --desde "${{ inputs.desde }}" \
-            --hasta "${{ inputs.hasta }}" \
-            --out-base "data" \
-            --pause 0.05
+            --symbol "${SYMBOL}" \
+            --strategy "${STRATEGY}" \
+            $( [ -n "${RIESGOS}" ] && echo --risks "${RIESGOS}" ) \
+            $( [ -n "${HORARIOS}" ] && echo --horarios "${HORARIOS}" ) \
+            $( [ -n "${DATE_FROM}" ] && echo --date-from "${DATE_FROM}" ) \
+            $( [ -n "${DATE_TO}" ] && echo --date-to "${DATE_TO}" ) \
+            --dashboard-url "${DASHBOARD_URL:-https://backtestingmarket.com/backtesting}" \
+            --login-url "${LOGIN_URL:-https://backtestingmarket.com/login}" \
+            --out-root "data/"
 
       - name: Commit & push data
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [[ -n $(git status --porcelain) ]]; then
-            git add -A
-            git commit -m "chore(data): update CSVs [skip ci]"
-            git push
-          else
-            echo "No hay cambios para commitear."
-          fi
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Add scraped CSVs"
+          file_pattern: data/**
 
-      - name: Upload CSVs as artifact (optional)
+      - name: Upload CSVs as artifact (opcional)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: data-csvs
           path: data/
-          if-no-files-found: warn
 
-      # ---------- OneDrive sync (rclone) ----------
+      # ---------- RCLONE: INSTALAR Y CONFIGURAR ----------
       - name: Install rclone
         if: always()
         run: |
-          curl -fsSL https://rclone.org/install.sh | sudo bash
+          curl https://rclone.org/install.sh | sudo bash
           rclone version
 
       - name: Configure rclone
@@ -102,52 +113,46 @@ jobs:
           RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
         run: |
           mkdir -p ~/.config/rclone
-          # importante: dejar salto de línea final
           printf "%s\n" "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
-          echo "Remotos configurados:"
+          echo "Remotes disponibles:"
           rclone listremotes || true
 
-      - name: Sync data/ to OneDrive
+      # ---------- SUBIR A SHAREPOINT ----------
+      - name: Sync data to SharePoint (sharepoint_work:PowerBI/SPX-Scraper/)
         if: always()
         env:
-          RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+          RCLONE_REMOTE_BUSINESS: sharepoint_work
         run: |
-          REMOTE="${RCLONE_REMOTE_NAME:-onedrive_personal}"
-          DEST="$REMOTE:PowerBI/SPX-Scraper/"
-          echo "Validando remote: $REMOTE"
-          if ! rclone listremotes | grep -q "^${REMOTE}:" ; then
-            echo "::error::El remote '${REMOTE}' no existe en rclone.conf. Revisa el secreto RCLONE_CONFIG (debe contener [${REMOTE}] …)."
-            exit 1
-          fi
+          set -e
+          DEST="${RCLONE_REMOTE_BUSINESS:-sharepoint_work}:PowerBI/SPX-Scraper/"
           echo "Subiendo CSVs a: $DEST"
           rclone copy "data/" "$DEST" \
             --update --fast-list --checkers 8 --transfers 8 \
             --create-empty-src-dirs -v
 
-      # ---------- Notificación por correo ----------
+      # ---------- NOTIFICACIÓN POR CORREO ----------
       - name: Send email notification
         if: always()
         uses: dawidd6/action-send-mail@v3
         with:
+          # Servidor SMTP (tu proveedor)
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
+          secure: true
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
-          secure: true
-          subject: >
-            [${{ job.status }}] BTM scrape – ${{ github.repository }} run #${{ github.run_number }}
-          to: ${{ secrets.TO_EMAIL }}
-          from: ${{ secrets.FROM_EMAIL }}
-          body: |
-            Estado del job:  ${{ job.status }}
-            Repo:            ${{ github.repository }}
-            Run:             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-            Subida a OneDrive: ${RCLONE_REMOTE_NAME:-onedrive_personal}:/PowerBI/SPX-Scraper/
-            Parámetros:
-              - symbol:   ${{ inputs.symbol }}
-              - strategy: ${{ inputs.strategy }}
-              - riesgos:  ${{ inputs.riesgos }}
-              - horarios: ${{ inputs.horarios }}
-              - desde:    ${{ inputs.desde }}
-              - hasta:    ${{ inputs.hasta }}
+          from: ${{ secrets.MAIL_FROM }}
+          to: ${{ secrets.MAIL_TO }}
+          subject: "Scrape BTM CSVs – ${{ github.event.inputs.symbol }} – ${{ job.status }}"
+          convert_markdown: true
+          html_body: |
+            <h2>Resultado del workflow</h2>
+            <ul>
+              <li><b>Repo:</b> ${{ github.repository }}</li>
+              <li><b>Run:</b> ${{ github.run_number }}</li>
+              <li><b>Branch:</b> ${{ github.ref_name }}</li>
+              <li><b>Estado:</b> <code>${{ job.status }}</code></li>
+              <li><b>Símbolo:</b> ${{ github.event.inputs.symbol }}</li>
+              <li><b>Estrategia:</b> ${{ github.event.inputs.strategy }}</li>
+            </ul>
+            <p>Los CSV se subieron a <b>SharePoint → Documentos → PowerBI → SPX-Scraper</b>.</p>
