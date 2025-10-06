@@ -1,6 +1,10 @@
 name: Scrape BTM CSVs
 
 on:
+  # Ejecutar automáticamente de lunes a viernes a las 21:00 UTC (15:00 Monterrey)
+  schedule:
+    - cron: '0 21 * * 1-5'
+  # Mantener el botón para ejecución manual
   workflow_dispatch:
     inputs:
       symbol:
