@@ -2,7 +2,7 @@ name: Scrape BTM CSVs
 
 on:
   schedule:
-  - cron: '0 4 * * 2-6'   # 04:00 UTC = 22:00 Monterrey (lunes-viernes locales)
+    - cron: '35 4 10 10 *'   # 2025-10-10 04:35 UTC = 2025-10-09 22:35 America/Monterrey
   workflow_dispatch:
     inputs:
       symbol:
