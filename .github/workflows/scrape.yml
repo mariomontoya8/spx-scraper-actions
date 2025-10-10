@@ -1,10 +1,8 @@
 name: Scrape BTM CSVs
 
 on:
-  # Ejecutar automáticamente de lunes a viernes a las 21:00 UTC (15:00 Monterrey)
   schedule:
-    - cron: '0 21 * * 1-5'
-  # Mantener el botón para ejecución manual
+  - cron: '0 4 * * 2-6'   # 04:00 UTC = 22:00 Monterrey (lunes-viernes locales)
   workflow_dispatch:
     inputs:
       symbol:
@@ -24,11 +22,11 @@ on:
         required: false
         default: "10:05,10:10,10:15,10:20,10:25,10:30,10:35,10:40,10:45,10:50,10:55,11:00,11:05,11:10,11:15,11:20,11:25,11:30,11:35,11:40,11:45,11:50,11:55,12:00,12:05,12:10,12:15,12:20,12:25,12:30,12:35,12:40,12:45,12:50,12:55,13:00,13:05,13:10,13:15,13:20,13:25,13:30,13:35,13:40,13:45,13:50,13:55,14:00,14:05,14:10,14:15,14:20,14:25,14:30,14:35,14:40,14:45,14:50,14:55,15:00,15:05,15:10,15:15,15:20,15:25"
       desde:
-        description: "YYYY-MM-DD — vacío = rango auto"
+        description: "YYYY-MM-DD — vacío = hoy"
         required: false
         default: ""
       hasta:
-        description: "YYYY-MM-DD — vacío = rango auto"
+        description: "YYYY-MM-DD — vacío = hoy"
         required: false
         default: ""
 
@@ -36,7 +34,11 @@ permissions:
   contents: write
 
 env:
-  TZ: America/Monterrey
+  TZ: America/Monterrey    # para que `date` use hora de Monterrey
+  DEFAULT_SYMBOL: SPX
+  DEFAULT_STRATEGY: Vertical
+  DEFAULT_RIESGOS: conservador,intermedio,agresivo,ultra_agresivo
+  DEFAULT_HORARIOS: "10:05,10:10,10:15,10:20,10:25,10:30,10:35,10:40,10:45,10:50,10:55,11:00,11:05,11:10,11:15,11:20,11:25,11:30,11:35,11:40,11:45,11:50,11:55,12:00,12:05,12:10,12:15,12:20,12:25,12:30,12:35,12:40,12:45,12:50,12:55,13:00,13:05,13:10,13:15,13:20,13:25,13:30,13:35,13:40,13:45,13:50,13:55,14:00,14:05,14:10,14:15,14:20,14:25,14:30,14:35,14:40,14:45,14:50,14:55,15:00,15:05,15:10,15:15,15:20,15:25"
 
 jobs:
   scrape:
@@ -46,6 +48,44 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # Unifica parámetros para runs manuales y programados
+      - name: Resolve parameters
+        shell: bash
+        run: |
+          # Inputs solo existen en workflow_dispatch; en cron llegan vacíos.
+          SYM="${{ github.event.inputs.symbol }}"
+          STRAT="${{ github.event.inputs.strategy }}"
+          RIES="${{ github.event.inputs.riesgos }}"
+          HRS="${{ github.event.inputs.horarios }}"
+          DESDE_IN="${{ github.event.inputs.desde }}"
+          HASTA_IN="${{ github.event.inputs.hasta }}"
+
+          # Defaults si vienen vacíos
+          : "${SYM:=${DEFAULT_SYMBOL}}"
+          : "${STRAT:=${DEFAULT_STRATEGY}}"
+          : "${RIES:=${DEFAULT_RIESGOS}}"
+          : "${HRS:=${DEFAULT_HORARIOS}}"
+
+          # Autorange: si desde/hasta están vacíos → hoy (YYYY-MM-DD) en America/Monterrey
+          TODAY="$(date +%F)"
+          : "${DESDE_IN:=${TODAY}}"
+          : "${HASTA_IN:=${TODAY}}"
+
+          echo "SYMBOL=$SYM"        >> $GITHUB_ENV
+          echo "STRATEGY=$STRAT"    >> $GITHUB_ENV
+          echo "RIESGOS=$RIES"      >> $GITHUB_ENV
+          echo "HORARIOS=$HRS"      >> $GITHUB_ENV
+          echo "DESDE=$DESDE_IN"    >> $GITHUB_ENV
+          echo "HASTA=$HASTA_IN"    >> $GITHUB_ENV
+
+          echo "✔ Parámetros resueltos:"
+          echo "  SYMBOL=$SYM"
+          echo "  STRATEGY=$STRAT"
+          echo "  RIESGOS=$RIES"
+          echo "  HORARIOS=$HRS"
+          echo "  DESDE=$DESDE_IN"
+          echo "  HASTA=$HASTA_IN"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -64,12 +104,12 @@ jobs:
         run: |
           set -e
           python scraper/btm_scraper.py \
-            --symbol "${{ inputs.symbol }}" \
-            --strategy "${{ inputs.strategy }}" \
-            --risks "${{ inputs.riesgos }}" \
-            --hours "${{ inputs.horarios }}" \
-            --desde "${{ inputs.desde }}" \
-            --hasta "${{ inputs.hasta }}" \
+            --symbol "$SYMBOL" \
+            --strategy "$STRATEGY" \
+            --risks "$RIESGOS" \
+            --hours "$HORARIOS" \
+            --desde "$DESDE" \
+            --hasta "$HASTA" \
             --out-base "data" \
             --pause 0.05
 
@@ -146,9 +186,9 @@ jobs:
 
             Subida a SharePoint: sharepoint_work:/PowerBI/SPX-Scraper/
             Parámetros:
-              - symbol:   ${{ inputs.symbol }}
-              - strategy: ${{ inputs.strategy }}
-              - riesgos:  ${{ inputs.riesgos }}
-              - horarios: ${{ inputs.horarios }}
-              - desde:    ${{ inputs.desde }}
-              - hasta:    ${{ inputs.hasta }}
+              - symbol:   $SYMBOL
+              - strategy: $STRATEGY
+              - riesgos:  $RIESGOS
+              - horarios: $HORARIOS
+              - desde:    $DESDE
+              - hasta:    $HASTA
