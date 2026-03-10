@@ -61,7 +61,7 @@ def normalize_time_hour(hora: str) -> str:
     return (m.group(1).zfill(2) + m.group(2)) if m else s.zfill(4)
 
 def get_timehour_options() -> List[str]:
-    r = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
+    r = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     values: List[str] = []
@@ -79,7 +79,7 @@ def get_timehour_options() -> List[str]:
     return out
 
 def get_risk_options() -> List[str]:
-    r = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
+    r = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     opts: List[str] = []
@@ -110,7 +110,7 @@ def fetch_table_csv(
     also_return_df: bool = False,
 ):
     hora_norm = normalize_time_hour(time_hhmm)
-    url = urljoin(BASE, "/backtestingIdea2/get_backtesting_idea")
+    url = urljoin(BASE, "/backtestingIdea/get_backtesting_idea")
     params = {
         "desde": desde, "hasta": hasta, "symbol": symbol,
         "estrategia": strategy, "hora": hora_norm, "risk": risk,
