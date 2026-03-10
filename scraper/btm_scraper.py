@@ -8,6 +8,7 @@ Flujo actualizado:
 - Detecta horas y riesgos desde la UI clásica /backtestingIdea
 - Lanza tarea en /backtestingIdea2/get_backtesting_idea
 - Consulta resultado en /backtestingIdea2/task_result/<task_id>
+- Reintenta hasta que el resultado esté listo
 - Guarda CSVs en data/<SYMBOL>/<Strategy>/<risk>/table_...csv
 - Escribe data/<SYMBOL>/<Strategy>/manifest.csv
 
@@ -69,7 +70,7 @@ def login(email: str, password: str) -> None:
     )
     r.raise_for_status()
 
-    # La vista HTML válida sigue siendo la clásica
+    # Validación de sesión contra la vista clásica
     chk = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
     chk.raise_for_status()
 
@@ -167,13 +168,13 @@ def fetch_table_csv(
     if isinstance(payload, dict) and "data" in payload:
         final_payload = payload
 
-    # Caso 2: respuesta asíncrona con task_id
-    elif isinstance(payload, dict) and payload.get("status") == "queued" and payload.get("task_id"):
+    # Caso 2: respuesta async con task_id
+    elif isinstance(payload, dict) and payload.get("task_id"):
         task_id = payload["task_id"]
         task_url = urljoin(BASE, f"/backtestingIdea2/task_result/{task_id}")
 
         final_payload = None
-        max_tries = 20
+        max_tries = 25
 
         for i in range(max_tries):
             rr = session.get(task_url, timeout=120)
@@ -183,27 +184,47 @@ def fetch_table_csv(
 
             task_payload = rr.json()
 
+            # Si ya trae data, listo
             if isinstance(task_payload, dict) and "data" in task_payload:
                 final_payload = task_payload
                 break
 
-            status = str(task_payload.get("status", "")).lower()
-            if status in {"queued", "processing", "pending"}:
-                time.sleep(1.5)
-                continue
+            # Si backend usa bandera result_ready / state
+            if isinstance(task_payload, dict):
+                result_ready = task_payload.get("result_ready")
+                state = str(task_payload.get("state", "")).upper()
 
+                # Aún procesando
+                if result_ready is False or state in {"STARTED", "PENDING", "PROCESSING", "PROGRESS"}:
+                    time.sleep(1.5)
+                    continue
+
+                # Si el backend marca listo con otro formato
+                if result_ready is True:
+                    final_payload = task_payload
+                    break
+
+                # Si falló explícitamente
+                if state in {"FAILURE", "FAILED", "ERROR"}:
+                    raise RuntimeError(f"Tarea falló: {task_payload}")
+
+            # Formato inesperado: salir y diagnosticar
             final_payload = task_payload
             break
 
         if final_payload is None:
-            raise RuntimeError(f"No se obtuvo resultado para task_id={task_id}")
+            raise RuntimeError(
+                f"No se obtuvo resultado para task_id={task_id} después de {max_tries} intentos"
+            )
 
     else:
         raise RuntimeError(f"Respuesta inicial inesperada: {str(payload)[:500]}")
 
     rows = final_payload.get("data", [])
     if not isinstance(rows, list):
-        raise RuntimeError(f"Respuesta final inesperada: {type(rows)} | body={str(final_payload)[:500]}")
+        raise RuntimeError(
+            f"Respuesta final inesperada: {type(rows)} | body={str(final_payload)[:500]}"
+        )
 
     if not rows:
         return None if not also_return_df else pd.DataFrame()
@@ -220,6 +241,7 @@ def fetch_table_csv(
         "strikes": "Strikes",
         "Strikes": "Strikes",
         "type": "Type",
+        "Type": "Type",
         "Option": "Option",
         "credit": "Credit",
         "Credit": "Credit",
