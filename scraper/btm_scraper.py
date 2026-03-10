@@ -3,9 +3,11 @@
 """
 Scraper BackTestingMarket (Backtesting Idea) sin Playwright.
 
-- Login con CSRF.
-- Detecta horas y riesgos desde la UI.
-- Llama el endpoint JSON /backtestingIdea2/get_backtesting_idea.
+Flujo actualizado:
+- Login con CSRF
+- Detecta horas y riesgos desde la UI
+- Lanza tarea en /backtestingIdea2/get_backtesting_idea
+- Consulta resultado en /backtestingIdea2/task_result/<task_id>
 - Guarda CSVs en data/<SYMBOL>/<Strategy>/<risk>/table_...csv
 - Escribe data/<SYMBOL>/<Strategy>/manifest.csv
 
@@ -14,7 +16,10 @@ Requiere secrets:
 """
 
 from __future__ import annotations
-import os, re, time, argparse
+import os
+import re
+import time
+import argparse
 from pathlib import Path
 from typing import List, Iterable, Dict, Any
 
@@ -27,57 +32,12 @@ BASE = os.getenv("BTM_BASE_URL", "https://backtestingmarket.com").rstrip("/")
 EMAIL = os.getenv("BTM_EMAIL")
 PASSWORD = os.getenv("BTM_PASSWORD")
 
-# Rutas candidatas
-IDEA_PAGE_CANDIDATES = [
-    "/backtestingIdea2",
-    "/backtestingIdea",
-]
-
-GET_BACKTESTING_IDEA_CANDIDATES = [
-    "/backtestingIdea2/get_backtesting_idea",
-    "/backtestingIdea/get_backtesting_idea",
-]
-
 # Sesión HTTP
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
 })
-
-# ---------- Helpers de rutas ----------
-def first_working_page(paths: List[str]) -> str:
-    last_error = None
-    for path in paths:
-        try:
-            r = session.get(urljoin(BASE, path), timeout=30)
-            if r.ok:
-                return path
-        except Exception as e:
-            last_error = e
-    raise RuntimeError(f"No se pudo abrir ninguna página candidata: {paths}. Último error: {last_error}")
-
-def first_working_json_endpoint(paths: List[str], params: dict) -> str:
-    last_status = None
-    last_body = None
-    last_error = None
-
-    for path in paths:
-        try:
-            url = urljoin(BASE, path)
-            r = session.get(url, params=params, timeout=120)
-            last_status = r.status_code
-            last_body = r.text[:500]
-
-            if r.ok:
-                return path
-        except Exception as e:
-            last_error = e
-
-    raise RuntimeError(
-        f"No funcionó ningún endpoint JSON. "
-        f"Candidates={paths} | status={last_status} | body={last_body} | error={last_error}"
-    )
 
 # ---------- Login (CSRF) ----------
 def _get_csrf_from_login() -> str | None:
@@ -87,7 +47,7 @@ def _get_csrf_from_login() -> str | None:
     token = soup.find("input", {"name": "csrf_token"})
     return token.get("value") if token else None
 
-def login(email: str, password: str) -> str:
+def login(email: str, password: str) -> None:
     if not email or not password:
         raise RuntimeError("Faltan BTM_EMAIL/BTM_PASSWORD.")
 
@@ -95,16 +55,23 @@ def login(email: str, password: str) -> str:
     if not csrf:
         raise RuntimeError("No se encontró csrf_token en /login")
 
-    payload = {"email": email, "password": password, "csrf_token": csrf}
-    r = session.post(urljoin(BASE, "/login"), data=payload, allow_redirects=True, timeout=60)
+    payload = {
+        "email": email,
+        "password": password,
+        "csrf_token": csrf,
+    }
+
+    r = session.post(
+        urljoin(BASE, "/login"),
+        data=payload,
+        allow_redirects=True,
+        timeout=60
+    )
     r.raise_for_status()
 
-    idea_page = first_working_page(IDEA_PAGE_CANDIDATES)
-    chk = session.get(urljoin(BASE, idea_page), timeout=30)
+    chk = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
     chk.raise_for_status()
-
-    print(f"✅ Login OK | idea_page={idea_page}")
-    return idea_page
+    print("✅ Login OK | idea_page=/backtestingIdea2")
 
 # ---------- Helpers ----------
 def normalize_time_hour(hora: str) -> str:
@@ -112,8 +79,8 @@ def normalize_time_hour(hora: str) -> str:
     m = re.search(r"(\d{1,2})\D?(\d{2})", s)
     return (m.group(1).zfill(2) + m.group(2)) if m else s.zfill(4)
 
-def get_timehour_options(idea_page: str) -> List[str]:
-    r = session.get(urljoin(BASE, idea_page), timeout=30)
+def get_timehour_options() -> List[str]:
+    r = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -132,8 +99,8 @@ def get_timehour_options(idea_page: str) -> List[str]:
             out.append(v)
     return out
 
-def get_risk_options(idea_page: str) -> List[str]:
-    r = session.get(urljoin(BASE, idea_page), timeout=30)
+def get_risk_options() -> List[str]:
+    r = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -175,6 +142,8 @@ def fetch_table_csv(
 ):
     hora_norm = normalize_time_hour(time_hhmm)
 
+    # 1) Lanzar tarea
+    url = urljoin(BASE, "/backtestingIdea2/get_backtesting_idea")
     params = {
         "desde": desde,
         "hasta": hasta,
@@ -184,23 +153,55 @@ def fetch_table_csv(
         "risk": risk,
     }
 
-    endpoint_path = first_working_json_endpoint(GET_BACKTESTING_IDEA_CANDIDATES, params)
-    url = urljoin(BASE, endpoint_path)
-
     r = session.get(url, params=params, timeout=120)
-
-    print(f"🌐 URL final: {r.url}")
-    print(f"📡 Status: {r.status_code}")
-
-    if not r.ok:
-        print(f"🧾 Body error: {r.text[:500]}")
+    print("🌐 URL:", r.url)
+    print("📡 STATUS:", r.status_code)
+    print("🧾 BODY:", r.text[:500])
     r.raise_for_status()
 
     payload = r.json()
-    rows = payload.get("data", payload if isinstance(payload, list) else [])
 
+    # Caso 1: respuesta directa con data
+    if isinstance(payload, dict) and "data" in payload:
+        final_payload = payload
+
+    # Caso 2: respuesta asíncrona con task_id
+    elif isinstance(payload, dict) and payload.get("status") == "queued" and payload.get("task_id"):
+        task_id = payload["task_id"]
+        task_url = urljoin(BASE, f"/backtestingIdea2/task_result/{task_id}")
+
+        final_payload = None
+        max_tries = 20
+
+        for i in range(max_tries):
+            rr = session.get(task_url, timeout=120)
+            print(f"⏳ TASK TRY {i+1}: {rr.status_code} | {task_url}")
+            print("🧾 TASK BODY:", rr.text[:500])
+            rr.raise_for_status()
+
+            task_payload = rr.json()
+
+            if isinstance(task_payload, dict) and "data" in task_payload:
+                final_payload = task_payload
+                break
+
+            status = str(task_payload.get("status", "")).lower()
+            if status in {"queued", "processing", "pending"}:
+                time.sleep(1.5)
+                continue
+
+            final_payload = task_payload
+            break
+
+        if final_payload is None:
+            raise RuntimeError(f"No se obtuvo resultado para task_id={task_id}")
+
+    else:
+        raise RuntimeError(f"Respuesta inicial inesperada: {str(payload)[:500]}")
+
+    rows = final_payload.get("data", [])
     if not isinstance(rows, list):
-        raise RuntimeError(f"Respuesta inesperada: {type(rows)} | body={str(payload)[:500]}")
+        raise RuntimeError(f"Respuesta final inesperada: {type(rows)} | body={str(final_payload)[:500]}")
 
     if not rows:
         return None if not also_return_df else pd.DataFrame()
@@ -210,24 +211,37 @@ def fetch_table_csv(
     rename_map = {
         "fecha": "Date",
         "date": "Date",
+        "Day": "Date",
         "hora": "Time",
         "time": "Time",
+        "Time": "Time",
         "strikes": "Strikes",
+        "Strikes": "Strikes",
         "type": "Type",
+        "Option": "Option",
         "credit": "Credit",
+        "Credit": "Credit",
         "price": "Price",
+        "Price": "Price",
         "close": "Close",
+        "Close": "Close",
         "result": "Result",
-        "strike_distance": "Strike Distance",
-        "moneyness": "Moneyness",
+        "P/L": "Result",
+        "Diff": "Diff",
+        "itmOtm": "ITM/OTM",
+        "movimiento_esperado": "Expected Move",
+        "score_30min": "Score 30min",
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
     if clean_numeric:
         def clean_money(x):
-            return pd.to_numeric(str(x).replace("$", "").replace(",", "").strip(), errors="coerce")
+            return pd.to_numeric(
+                str(x).replace("$", "").replace(",", "").strip(),
+                errors="coerce"
+            )
 
-        for c in ["Credit", "Price", "Close", "Result", "Strike Distance", "Moneyness"]:
+        for c in ["Credit", "Price", "Close", "Result", "Diff", "Expected Move", "Score 30min"]:
             if c in df.columns:
                 df[c] = df[c].map(clean_money)
 
@@ -253,7 +267,6 @@ def bulk_download_tables(
     hasta: str | None,
     hours: Iterable[str] | None,
     risks: Iterable[str] | None,
-    idea_page: str,
     out_base: str = "data",
     pause_s: float = 0.1,
     overwrite: bool = False,
@@ -266,10 +279,10 @@ def bulk_download_tables(
         print(f"🗓️ Rango auto: {desde} → {hasta}")
 
     if hours is None or (isinstance(hours, str) and hours.strip().lower() in {"", "auto", "all"}):
-        hours = get_timehour_options(idea_page)
+        hours = get_timehour_options()
 
     if risks is None or (isinstance(risks, str) and risks.strip().lower() in {"", "auto", "all"}):
-        risks = get_risk_options(idea_page)
+        risks = get_risk_options()
 
     hours = list(hours)
     risks = [str(r).strip().lower().replace(" ", "_") for r in risks]
@@ -292,7 +305,13 @@ def bulk_download_tables(
             if fpath.exists() and not overwrite:
                 total_skipped += 1
                 print(f"⏭️ Ya existe, salto: {fpath.name}")
-                manifest.append({"risk": risk, "hour": hhmm, "file": str(fpath), "rows": None, "status": "skipped"})
+                manifest.append({
+                    "risk": risk,
+                    "hour": hhmm,
+                    "file": str(fpath),
+                    "rows": None,
+                    "status": "skipped"
+                })
                 continue
 
             try:
@@ -313,15 +332,33 @@ def bulk_download_tables(
                 if df is None or rows == 0:
                     total_empty += 1
                     print(f"⚠️ Vacío: {risk:<16} {hhmm} -> {fname}")
-                    manifest.append({"risk": risk, "hour": hhmm, "file": str(fpath), "rows": 0, "status": "empty"})
+                    manifest.append({
+                        "risk": risk,
+                        "hour": hhmm,
+                        "file": str(fpath),
+                        "rows": 0,
+                        "status": "empty"
+                    })
                 else:
                     total_done += 1
-                    manifest.append({"risk": risk, "hour": hhmm, "file": str(fpath), "rows": rows, "status": "ok"})
+                    manifest.append({
+                        "risk": risk,
+                        "hour": hhmm,
+                        "file": str(fpath),
+                        "rows": rows,
+                        "status": "ok"
+                    })
                     print(f"✅ {risk:<16} {hhmm}: {rows:>4} filas -> {fname}")
 
             except Exception as e:
                 print(f"❌ Error {risk} {hhmm}: {e}")
-                manifest.append({"risk": risk, "hour": hhmm, "file": str(fpath), "rows": 0, "status": f"error:{e}"})
+                manifest.append({
+                    "risk": risk,
+                    "hour": hhmm,
+                    "file": str(fpath),
+                    "rows": 0,
+                    "status": f"error:{e}"
+                })
             finally:
                 time.sleep(pause_s)
 
@@ -360,10 +397,14 @@ def main():
     args = parse_args()
     print(f"▶️ Run SYMBOL={args.symbol} STRATEGY={args.strategy}")
 
-    idea_page = login(EMAIL, PASSWORD)
+    login(EMAIL, PASSWORD)
 
-    hours = None if args.hours.strip().lower() in {"", "auto", "all"} else [h.strip() for h in args.hours.split(",") if h.strip()]
-    risks = None if args.risks.strip().lower() in {"", "auto", "all"} else [r.strip() for r in args.risks.split(",") if r.strip()]
+    hours = None if args.hours.strip().lower() in {"", "auto", "all"} else [
+        h.strip() for h in args.hours.split(",") if h.strip()
+    ]
+    risks = None if args.risks.strip().lower() in {"", "auto", "all"} else [
+        r.strip() for r in args.risks.split(",") if r.strip()
+    ]
 
     bulk_download_tables(
         symbol=args.symbol,
@@ -372,7 +413,6 @@ def main():
         hasta=args.hasta or None,
         hours=hours,
         risks=risks,
-        idea_page=idea_page,
         out_base=args.out_base,
         pause_s=args.pause,
         overwrite=args.overwrite,
