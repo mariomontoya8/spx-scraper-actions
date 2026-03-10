@@ -1,126 +1,132 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Scraper BackTestingMarket (Backtesting Idea) sin Playwright.
 
+Flujo actualizado:
+- Login con CSRF
+- Detecta horas y riesgos desde la UI clásica /backtestingIdea
+- Lanza tarea en /backtestingIdea2/get_backtesting_idea
+- Consulta resultado en /backtestingIdea2/task_result/<task_id>
+- Reintenta hasta que el resultado esté listo
+- Guarda CSVs en data/<SYMBOL>/<Strategy>/<risk>/table_...csv
+- Escribe data/<SYMBOL>/<Strategy>/manifest.csv
+
+Requiere secrets:
+  BTM_EMAIL, BTM_PASSWORD
+"""
+
+from __future__ import annotations
 import os
 import re
-import sys
-import csv
-import json
 import time
 import argparse
-from typing import Dict, List, Tuple, Optional
-from urllib.parse import urljoin
+from pathlib import Path
+from typing import List, Iterable, Dict, Any, Tuple, Optional
 
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 
-BASE = "https://www.backtestingmarket.com"
-LOGIN_URL = "https://www.backtestingmarket.com/login"
-IDEA_URL = "https://www.backtestingmarket.com/backtesting-idea"
+BASE = os.getenv("BTM_BASE_URL", "https://backtestingmarket.com").rstrip("/")
+EMAIL = os.getenv("BTM_EMAIL")
+PASSWORD = os.getenv("BTM_PASSWORD")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
-}
+})
+
+# Cache simple para no pegarle dos veces a /backtestingIdea
+_BACKTESTING_IDEA_HTML: Optional[str] = None
 
 
-# =========================
-# Helpers
-# =========================
-
-def clean_text(x) -> str:
-    if x is None:
-        return ""
-    return str(x).strip()
-
-
-def first_not_empty(*vals):
-    for v in vals:
-        if v is not None and str(v).strip() != "":
-            return v
-    return None
+# ---------- Login (CSRF) ----------
+def _get_csrf_from_login() -> str | None:
+    r = session.get(urljoin(BASE, "/login"), timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    token = soup.find("input", {"name": "csrf_token"})
+    return token.get("value") if token else None
 
 
-def extract_csrf(html: str) -> Tuple[Optional[str], Optional[str]]:
+def login(email: str, password: str) -> None:
+    if not email or not password:
+        raise RuntimeError("Faltan BTM_EMAIL/BTM_PASSWORD.")
+
+    csrf = _get_csrf_from_login()
+    if not csrf:
+        raise RuntimeError("No se encontró csrf_token en /login")
+
+    payload = {
+        "email": email,
+        "password": password,
+        "csrf_token": csrf,
+    }
+
+    r = session.post(
+        urljoin(BASE, "/login"),
+        data=payload,
+        allow_redirects=True,
+        timeout=60,
+    )
+    r.raise_for_status()
+
+    chk = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
+    chk.raise_for_status()
+
+    global _BACKTESTING_IDEA_HTML
+    _BACKTESTING_IDEA_HTML = chk.text
+
+    print("✅ Login OK")
+
+
+# ---------- Helpers ----------
+def normalize_time_hour(hora: str) -> str:
+    s = str(hora).strip().replace(":", "")
+    m = re.search(r"(\d{1,2})\D?(\d{2})", s)
+    return (m.group(1).zfill(2) + m.group(2)) if m else s.zfill(4)
+
+
+def _get_backtestingidea_html() -> str:
+    global _BACKTESTING_IDEA_HTML
+    if _BACKTESTING_IDEA_HTML is None:
+        r = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
+        r.raise_for_status()
+        _BACKTESTING_IDEA_HTML = r.text
+    return _BACKTESTING_IDEA_HTML
+
+
+def _parse_ui_options() -> Tuple[List[str], List[str]]:
+    html = _get_backtestingidea_html()
     soup = BeautifulSoup(html, "html.parser")
-    for inp in soup.select("input[type='hidden']"):
-        name = inp.get("name")
-        value = inp.get("value")
-        if name and value and (
-            "csrf" in name.lower()
-            or "_token" in name.lower()
-            or "token" == name.lower()
-        ):
-            return name, value
-    return None, None
 
+    hours: List[str] = []
+    risks: List[str] = []
 
-def discover_api_endpoint(html: str) -> Optional[str]:
-    patterns = [
-        r'["\'](\/backtestingIdea\/get_backtesting_[^"\']+)["\']',
-        r'["\'](\/backtesting-idea\/get_backtesting_[^"\']+)["\']',
-        r'["\'](\/[^"\']*get_backtesting[^"\']*)["\']',
-    ]
-    for pat in patterns:
-        m = re.search(pat, html, flags=re.I)
-        if m:
-            return urljoin(BASE, m.group(1))
-    return None
+    sel_hour = soup.find(id="timeHour") or soup.find("select", {"name": "timeHour"})
+    if sel_hour:
+        for opt in sel_hour.find_all("option"):
+            t = (opt.text or "").strip()
+            if t and t.lower() != "selecciona una hora":
+                hours.append(t)
 
+    sel_risk = soup.find(id="risk") or soup.find("select", {"name": "risk"})
+    if sel_risk:
+        for opt in sel_risk.find_all("option"):
+            val = (opt.get("value") or opt.text or "").strip()
+            low = val.lower()
+            if val and low not in {"selecciona", "selecciona un riesgo"}:
+                risks.append(low.replace(" ", "_"))
 
-def parse_select_options(html: str) -> Tuple[List[str], List[str]]:
-    soup = BeautifulSoup(html, "html.parser")
-
-    hours = []
-    risks = []
-
-    # Buscar selects por id/name/class/texto
-    for sel in soup.select("select"):
-        meta = " ".join(
-            filter(
-                None,
-                [
-                    sel.get("id", ""),
-                    sel.get("name", ""),
-                    " ".join(sel.get("class", [])),
-                ],
-            )
-        ).lower()
-
-        vals = [
-            clean_text(opt.get("value")) or clean_text(opt.text)
-            for opt in sel.select("option")
-        ]
-        vals = [v for v in vals if v]
-
-        if not vals:
-            continue
-
-        if any(k in meta for k in ["hour", "time", "entry"]):
-            hours.extend(vals)
-        elif any(k in meta for k in ["risk", "profile"]):
-            risks.extend(vals)
-
-    # Fallback por regex en html/js
-    if not hours:
-        hours = sorted(set(re.findall(r"\b\d{2}-\d{2}\b", html)))
-
-    if not risks:
-        candidate_risks = re.findall(
-            r"(conservador|intermedio|agresivo|ultra\s*agresivo)",
-            html,
-            flags=re.I,
-        )
-        risks = sorted(set(x.lower().replace(" ", "_") for x in candidate_risks))
-
-    # limpiar duplicados preservando orden
-    def dedupe(seq):
+    def dedupe(items: List[str]) -> List[str]:
         seen = set()
         out = []
-        for x in seq:
-            x = clean_text(x)
-            if x and x not in seen:
+        for x in items:
+            if x not in seen:
                 seen.add(x)
                 out.append(x)
         return out
@@ -128,204 +134,337 @@ def parse_select_options(html: str) -> Tuple[List[str], List[str]]:
     return dedupe(hours), dedupe(risks)
 
 
-def try_json(resp: requests.Response):
-    try:
-        return resp.json()
-    except Exception:
-        return None
+def get_timehour_options() -> List[str]:
+    hours, _ = _parse_ui_options()
+    return hours
 
 
-def normalize_rows(payload, date_str: str, hour: str, risk: str) -> List[Dict]:
-    rows = []
-
-    if isinstance(payload, dict):
-        # buscar listas comunes
-        for key in ["data", "results", "rows", "table", "response"]:
-            if isinstance(payload.get(key), list):
-                payload = payload[key]
-                break
-
-    if isinstance(payload, list):
-        for item in payload:
-            if isinstance(item, dict):
-                row = {"date": date_str, "hour": hour, "risk": risk}
-                row.update(item)
-                rows.append(row)
-    elif isinstance(payload, dict):
-        row = {"date": date_str, "hour": hour, "risk": risk}
-        row.update(payload)
-        rows.append(row)
-
-    return rows
+def get_risk_options() -> List[str]:
+    _, risks = _parse_ui_options()
+    return risks
 
 
-# =========================
-# Core
-# =========================
+def get_dates(symbol: str) -> List[str]:
+    r = session.get(urljoin(BASE, "/get_dates"), params={"symbol": symbol}, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    if isinstance(js, dict):
+        js = js.get("data", js)
+    return list(sorted(set(js)))
 
-class BTMClient:
-    def __init__(self, email: str, password: str, timeout: int = 30):
-        self.email = email
-        self.password = password
-        self.timeout = timeout
-        self.s = requests.Session()
-        self.s.headers.update(HEADERS)
 
-    def login(self):
-        r = self.s.get(LOGIN_URL, timeout=self.timeout)
-        r.raise_for_status()
-
-        token_name, token_value = extract_csrf(r.text)
-
-        payload = {
-            "email": self.email,
-            "password": self.password,
-        }
-        if token_name and token_value:
-            payload[token_name] = token_value
-
-        r = self.s.post(LOGIN_URL, data=payload, timeout=self.timeout, allow_redirects=True)
-        r.raise_for_status()
-
-        text = r.text.lower()
-        if "login" in r.url.lower() and "logout" not in text and "dashboard" not in text:
-            raise RuntimeError("Login no exitoso. Revisa usuario/contraseña o cambios en el form.")
-
-    def load_idea_page(self) -> Tuple[str, List[str], List[str], str]:
-        r = self.s.get(IDEA_URL, timeout=self.timeout)
-        r.raise_for_status()
-
-        html = r.text
-        api_url = discover_api_endpoint(html)
-        if not api_url:
-            raise RuntimeError("No pude detectar el endpoint API. Revisa el HTML actual de la página.")
-
-        hours, risks = parse_select_options(html)
-        if not hours:
-            raise RuntimeError("No pude detectar horarios.")
-        if not risks:
-            raise RuntimeError("No pude detectar perfiles de riesgo.")
-
-        return html, hours, risks, api_url
-
-    def fetch_one(self, api_url: str, date_str: str, hour: str, risk: str) -> List[Dict]:
-        """
-        Intenta varios nombres de parámetros porque BTM cambia entre pantallas.
-        """
-        candidate_payloads = [
-            {"date": date_str, "hour": hour, "risk": risk},
-            {"day": date_str, "hour": hour, "risk": risk},
-            {"date": date_str, "entryHour": hour, "risk": risk},
-            {"date": date_str, "entry_hour": hour, "risk": risk},
-            {"date": date_str, "time": hour, "risk": risk},
-            {"date": date_str, "hour": hour, "riskProfile": risk},
-            {"date": date_str, "hour": hour, "risk_profile": risk},
-        ]
-
-        last_error = None
-
-        for payload in candidate_payloads:
-            try:
-                r = self.s.post(api_url, data=payload, timeout=self.timeout)
-                if r.status_code == 404:
-                    continue
-                r.raise_for_status()
-
-                data = try_json(r)
-                if data is None:
-                    # a veces responde HTML/texto con json embebido
-                    txt = r.text.strip()
-                    if txt.startswith("{") or txt.startswith("["):
-                        data = json.loads(txt)
-                    else:
-                        continue
-
-                rows = normalize_rows(data, date_str, hour, risk)
-                if rows:
-                    return rows
-
-            except Exception as e:
-                last_error = e
-                continue
-
-        if last_error:
-            print(f"[WARN] {date_str} | {hour} | {risk} -> {last_error}", flush=True)
-
+def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
         return []
 
+    data = payload.get("data", [])
+    return data if isinstance(data, list) else []
 
-# =========================
-# Output
-# =========================
 
-def write_csv(rows: List[Dict], output_file: str):
+def _poll_task_result(task_id: str, max_tries: int = 20, sleep_s: float = 0.8) -> Dict[str, Any]:
+    task_url = urljoin(BASE, f"/backtestingIdea2/task_result/{task_id}")
+    last_payload: Dict[str, Any] = {}
+
+    for i in range(max_tries):
+        rr = session.get(task_url, timeout=120)
+        rr.raise_for_status()
+
+        task_payload = rr.json()
+        if isinstance(task_payload, dict):
+            last_payload = task_payload
+        else:
+            last_payload = {"raw": task_payload}
+
+        rows = _extract_rows_from_payload(last_payload)
+        if rows:
+            return last_payload
+
+        if isinstance(last_payload, dict):
+            result_ready = last_payload.get("result_ready")
+            state = str(last_payload.get("state", "")).upper()
+
+            if state in {"FAILURE", "FAILED", "ERROR"}:
+                raise RuntimeError(f"Tarea falló: {last_payload}")
+
+            # Si aún no está lista, seguimos consultando el endpoint final
+            if result_ready is False or state in {"STARTED", "PENDING", "PROCESSING", "PROGRESS", ""}:
+                time.sleep(sleep_s)
+                continue
+
+            # Si backend dice ready pero aún no trae filas, devolvemos eso
+            if result_ready is True:
+                return last_payload
+
+        time.sleep(sleep_s)
+
+    return last_payload
+
+
+# ---------- Descarga de una tabla ----------
+def fetch_table_csv(
+    symbol: str,
+    desde: str,
+    hasta: str,
+    time_hhmm: str,
+    strategy: str,
+    risk: str,
+    out_dir: str,
+    filename: str | None = None,
+    clean_numeric: bool = True,
+    also_return_df: bool = False,
+):
+    hora_norm = normalize_time_hour(time_hhmm)
+
+    url = urljoin(BASE, "/backtestingIdea2/get_backtesting_idea")
+    params = {
+        "desde": desde,
+        "hasta": hasta,
+        "symbol": symbol,
+        "estrategia": strategy,
+        "hora": hora_norm,
+        "risk": risk,
+    }
+
+    r = session.get(url, params=params, timeout=120)
+    r.raise_for_status()
+    payload = r.json()
+
+    # Caso 1: respuesta directa con data
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        final_payload = payload
+
+    # Caso 2: async -> siempre seguimos consultando el último endpoint task_result/<task_id>
+    elif isinstance(payload, dict) and payload.get("task_id"):
+        task_id = payload["task_id"]
+        final_payload = _poll_task_result(task_id=task_id, max_tries=20, sleep_s=0.8)
+
+    else:
+        raise RuntimeError(f"Respuesta inicial inesperada: {str(payload)[:300]}")
+
+    rows = final_payload.get("data", []) if isinstance(final_payload, dict) else []
+    if not isinstance(rows, list):
+        raise RuntimeError(
+            f"Respuesta final inesperada: {type(rows)} | body={str(final_payload)[:300]}"
+        )
+
     if not rows:
-        print("No hubo registros para guardar.")
-        return
+        return None if not also_return_df else pd.DataFrame()
 
-    keys = set()
-    for r in rows:
-        keys.update(r.keys())
+    df = pd.DataFrame(rows)
 
-    preferred = ["date", "hour", "risk"]
-    rest = sorted(k for k in keys if k not in preferred)
-    fieldnames = preferred + rest
+    rename_map = {
+        "fecha": "Date",
+        "date": "Date",
+        "Day": "Date",
+        "hora": "Time",
+        "time": "Time",
+        "Time": "Time",
+        "strikes": "Strikes",
+        "Strikes": "Strikes",
+        "type": "Type",
+        "Type": "Type",
+        "Option": "Option",
+        "credit": "Credit",
+        "Credit": "Credit",
+        "price": "Price",
+        "Price": "Price",
+        "close": "Close",
+        "Close": "Close",
+        "result": "Result",
+        "P/L": "Result",
+        "Diff": "Diff",
+        "itmOtm": "ITM/OTM",
+        "movimiento_esperado": "Expected Move",
+        "score_30min": "Score 30min",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    if clean_numeric:
+        def clean_money(x):
+            return pd.to_numeric(
+                str(x).replace("$", "").replace(",", "").strip(),
+                errors="coerce"
+            )
 
-    print(f"CSV generado: {output_file} ({len(rows)} filas)")
+        for c in ["Credit", "Price", "Close", "Result", "Diff", "Expected Move", "Score 30min"]:
+            if c in df.columns:
+                df[c] = df[c].map(clean_money)
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    if filename is None:
+        safe_risk = re.sub(r"\s+", "", str(risk))
+        safe_strategy = re.sub(r"\s+", "", str(strategy))
+        filename = f"table_{symbol}_{safe_strategy}_{safe_risk}_{hora_norm}_{desde}_{hasta}.csv"
+
+    csv_file = out_path / filename
+    df.to_csv(csv_file, index=False, encoding="utf-8")
+    print(f"💾 CSV guardado: {csv_file} | Filas: {len(df)}")
+
+    return df if also_return_df else None
 
 
-# =========================
-# Main
-# =========================
+# ---------- Descarga masiva ----------
+def bulk_download_tables(
+    symbol: str,
+    strategy: str,
+    desde: str | None,
+    hasta: str | None,
+    hours: Iterable[str] | None,
+    risks: Iterable[str] | None,
+    out_base: str = "data",
+    pause_s: float = 0.1,
+    overwrite: bool = False,
+) -> pd.DataFrame:
+    if not desde or not hasta:
+        dates = get_dates(symbol)
+        if not dates:
+            raise RuntimeError("No se pudieron obtener fechas con /get_dates.")
+        desde, hasta = dates[0], dates[-1]
+        print(f"🗓️ Rango auto: {desde} → {hasta}")
+
+    if hours is None or (isinstance(hours, str) and hours.strip().lower() in {"", "auto", "all"}):
+        hours = get_timehour_options()
+
+    if risks is None or (isinstance(risks, str) and risks.strip().lower() in {"", "auto", "all"}):
+        risks = get_risk_options()
+
+    hours = list(hours)
+    risks = [str(r).strip().lower().replace(" ", "_") for r in risks]
+
+    base = Path(out_base) / symbol / strategy
+    base.mkdir(parents=True, exist_ok=True)
+
+    manifest: List[Dict[str, Any]] = []
+    total_done = total_empty = total_skipped = 0
+
+    for risk in risks:
+        risk_dir = base / risk
+        risk_dir.mkdir(parents=True, exist_ok=True)
+
+        for hour in hours:
+            hhmm = normalize_time_hour(hour)
+            fname = f"table_{symbol}_{strategy}_{risk}_{hhmm}_{desde}_{hasta}.csv"
+            fpath = risk_dir / fname
+
+            if fpath.exists() and not overwrite:
+                total_skipped += 1
+                print(f"⏭️ Ya existe, salto: {fpath.name}")
+                manifest.append({
+                    "risk": risk,
+                    "hour": hhmm,
+                    "file": str(fpath),
+                    "rows": None,
+                    "status": "skipped"
+                })
+                continue
+
+            try:
+                df = fetch_table_csv(
+                    symbol=symbol,
+                    desde=desde,
+                    hasta=hasta,
+                    time_hhmm=hhmm,
+                    strategy=strategy,
+                    risk=risk,
+                    out_dir=str(risk_dir),
+                    filename=fname,
+                    also_return_df=True,
+                )
+
+                rows = 0 if df is None else int(len(df))
+
+                if df is None or rows == 0:
+                    total_empty += 1
+                    print(f"⚠️ Vacío: {risk:<16} {hhmm} -> {fname}")
+                    manifest.append({
+                        "risk": risk,
+                        "hour": hhmm,
+                        "file": str(fpath),
+                        "rows": 0,
+                        "status": "empty"
+                    })
+                else:
+                    total_done += 1
+                    manifest.append({
+                        "risk": risk,
+                        "hour": hhmm,
+                        "file": str(fpath),
+                        "rows": rows,
+                        "status": "ok"
+                    })
+                    print(f"✅ {risk:<16} {hhmm}: {rows:>4} filas -> {fname}")
+
+            except Exception as e:
+                print(f"❌ Error {risk} {hhmm}: {e}")
+                manifest.append({
+                    "risk": risk,
+                    "hour": hhmm,
+                    "file": str(fpath),
+                    "rows": 0,
+                    "status": f"error:{e}"
+                })
+            finally:
+                time.sleep(pause_s)
+
+    man_df = pd.DataFrame(manifest)
+    man_df.to_csv(base / "manifest.csv", index=False)
+
+    print("\nResumen:")
+    print(f"  OK: {total_done} | Vacíos: {total_empty} | Saltados: {total_skipped}")
+    print(f"  Manifest: {base / 'manifest.csv'}")
+
+    return man_df
+
+
+# ---------- CLI ----------
+def parse_args():
+    p = argparse.ArgumentParser(description="Descarga masiva Backtesting Idea (sin navegador)")
+    p.add_argument("--symbol", default=os.getenv("SYMBOL", "SPX"))
+    p.add_argument("--strategy", default=os.getenv("STRATEGY", "Vertical"))
+    p.add_argument("--desde", default=os.getenv("DESDE", ""))
+    p.add_argument("--hasta", default=os.getenv("HASTA", ""))
+    p.add_argument(
+        "--risks",
+        default=os.getenv("RISKS", "auto"),
+        help="CSV: conservador,intermedio,agresivo,ultra_agresivo | 'auto'"
+    )
+    p.add_argument(
+        "--hours",
+        default=os.getenv("HORARIOS", "auto"),
+        help="CSV: 09:40,10:00,... | 'auto'"
+    )
+    p.add_argument("--out-base", default=os.getenv("OUT_BASE", "data"))
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--pause", type=float, default=float(os.getenv("PAUSE_S", "0.10")))
+    return p.parse_args()
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--date", required=True, help="Fecha YYYY-MM-DD")
-    parser.add_argument("--output", default="btm_output.csv")
-    parser.add_argument("--hours", default="", help="Ej: 10-05,10-15,10-30")
-    parser.add_argument("--risks", default="", help="Ej: conservador,intermedio")
-    parser.add_argument("--sleep", type=float, default=0.0, help="Pausa entre requests")
-    args = parser.parse_args()
+    args = parse_args()
+    print(f"▶️ Run SYMBOL={args.symbol} STRATEGY={args.strategy}")
 
-    email = os.getenv("BTM_EMAIL", "").strip()
-    password = os.getenv("BTM_PASSWORD", "").strip()
+    login(EMAIL, PASSWORD)
 
-    if not email or not password:
-        print("Faltan variables de entorno BTM_EMAIL y BTM_PASSWORD", file=sys.stderr)
-        sys.exit(1)
+    hours = None if args.hours.strip().lower() in {"", "auto", "all"} else [
+        h.strip() for h in args.hours.split(",") if h.strip()
+    ]
+    risks = None if args.risks.strip().lower() in {"", "auto", "all"} else [
+        r.strip() for r in args.risks.split(",") if r.strip()
+    ]
 
-    client = BTMClient(email, password)
-
-    print("Login...")
-    client.login()
-
-    print("Cargando página...")
-    _, detected_hours, detected_risks, api_url = client.load_idea_page()
-
-    selected_hours = [x.strip() for x in args.hours.split(",") if x.strip()] or detected_hours
-    selected_risks = [x.strip() for x in args.risks.split(",") if x.strip()] or detected_risks
-
-    print(f"API detectada: {api_url}")
-    print(f"Hours: {selected_hours}")
-    print(f"Risks: {selected_risks}")
-
-    all_rows = []
-
-    for risk in selected_risks:
-        for hour in selected_hours:
-            print(f"Consultando {args.date} | {hour} | {risk} ...", flush=True)
-            rows = client.fetch_one(api_url, args.date, hour, risk)
-            if rows:
-                all_rows.extend(rows)
-            if args.sleep > 0:
-                time.sleep(args.sleep)
-
-    write_csv(all_rows, args.output)
+    bulk_download_tables(
+        symbol=args.symbol,
+        strategy=args.strategy,
+        desde=args.desde or None,
+        hasta=args.hasta or None,
+        hours=hours,
+        risks=risks,
+        out_base=args.out_base,
+        pause_s=args.pause,
+        overwrite=args.overwrite,
+    )
 
 
 if __name__ == "__main__":
