@@ -110,7 +110,7 @@ def fetch_table_csv(
     also_return_df: bool = False,
 ):
     hora_norm = normalize_time_hour(time_hhmm)
-    url = urljoin(BASE, "/backtestingIdea/get_backtesting_idea")
+    url = urljoin(BASE, "/backtestingIdea2/get_backtesting_idea")
     params = {
         "desde": desde, "hasta": hasta, "symbol": symbol,
         "estrategia": strategy, "hora": hora_norm, "risk": risk,
