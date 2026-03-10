@@ -5,7 +5,7 @@ Scraper BackTestingMarket (Backtesting Idea) sin Playwright.
 
 Flujo actualizado:
 - Login con CSRF
-- Detecta horas y riesgos desde la UI
+- Detecta horas y riesgos desde la UI clásica /backtestingIdea
 - Lanza tarea en /backtestingIdea2/get_backtesting_idea
 - Consulta resultado en /backtestingIdea2/task_result/<task_id>
 - Guarda CSVs en data/<SYMBOL>/<Strategy>/<risk>/table_...csv
@@ -69,9 +69,11 @@ def login(email: str, password: str) -> None:
     )
     r.raise_for_status()
 
-    chk = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
+    # La vista HTML válida sigue siendo la clásica
+    chk = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
     chk.raise_for_status()
-    print("✅ Login OK | idea_page=/backtestingIdea2")
+
+    print("✅ Login OK")
 
 # ---------- Helpers ----------
 def normalize_time_hour(hora: str) -> str:
@@ -80,7 +82,7 @@ def normalize_time_hour(hora: str) -> str:
     return (m.group(1).zfill(2) + m.group(2)) if m else s.zfill(4)
 
 def get_timehour_options() -> List[str]:
-    r = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
+    r = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -100,7 +102,7 @@ def get_timehour_options() -> List[str]:
     return out
 
 def get_risk_options() -> List[str]:
-    r = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
+    r = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
