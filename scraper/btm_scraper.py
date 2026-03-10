@@ -50,7 +50,7 @@ def login(email: str, password: str) -> None:
     payload = {"email": email, "password": password, "csrf_token": csrf}
     r = session.post(urljoin(BASE, "/login"), data=payload, allow_redirects=True, timeout=60)
     r.raise_for_status()
-    chk = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
+    chk = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
     chk.raise_for_status()
     print("✅ Login OK")
 
@@ -61,7 +61,7 @@ def normalize_time_hour(hora: str) -> str:
     return (m.group(1).zfill(2) + m.group(2)) if m else s.zfill(4)
 
 def get_timehour_options() -> List[str]:
-    r = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
+    r = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     values: List[str] = []
@@ -79,7 +79,7 @@ def get_timehour_options() -> List[str]:
     return out
 
 def get_risk_options() -> List[str]:
-    r = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
+    r = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     opts: List[str] = []
