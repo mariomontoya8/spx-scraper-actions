@@ -50,7 +50,7 @@ def login(email: str, password: str) -> None:
     payload = {"email": email, "password": password, "csrf_token": csrf}
     r = session.post(urljoin(BASE, "/login"), data=payload, allow_redirects=True, timeout=60)
     r.raise_for_status()
-    chk = session.get(urljoin(BASE, "/backtestingIdea2"), timeout=30)
+    chk = session.get(urljoin(BASE, "/backtestingIdea"), timeout=30)
     chk.raise_for_status()
     print("✅ Login OK")
 
