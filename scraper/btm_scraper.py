@@ -3,7 +3,7 @@
 """
 Scraper BackTestingMarket (Backtesting Idea) sin Playwright.
 
-Flujo actualizado:
+Flujo:
 - Login con CSRF
 - Detecta horas y riesgos desde la UI clásica /backtestingIdea
 - Lanza tarea en /backtestingIdea2/get_backtesting_idea
@@ -28,19 +28,24 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from requests.adapters import HTTPAdapter
 
 
 BASE = os.getenv("BTM_BASE_URL", "https://backtestingmarket.com").rstrip("/")
 EMAIL = os.getenv("BTM_EMAIL")
 PASSWORD = os.getenv("BTM_PASSWORD")
 
+# Sesión HTTP
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
 })
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
-# Cache simple para no pegarle dos veces a /backtestingIdea
+# Cache simple para no pedir /backtestingIdea dos veces
 _BACKTESTING_IDEA_HTML: Optional[str] = None
 
 
@@ -71,7 +76,7 @@ def login(email: str, password: str) -> None:
         urljoin(BASE, "/login"),
         data=payload,
         allow_redirects=True,
-        timeout=60,
+        timeout=60
     )
     r.raise_for_status()
 
@@ -156,16 +161,19 @@ def get_dates(symbol: str) -> List[str]:
 def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
-
     data = payload.get("data", [])
     return data if isinstance(data, list) else []
 
 
-def _poll_task_result(task_id: str, max_tries: int = 20, sleep_s: float = 0.8) -> Dict[str, Any]:
+def _poll_task_result(task_id: str, max_tries: int = 18, sleep_s: float = 0.6) -> Dict[str, Any]:
+    """
+    Consulta SIEMPRE el endpoint final /task_result/<task_id>
+    hasta que regrese data o termine el número de intentos.
+    """
     task_url = urljoin(BASE, f"/backtestingIdea2/task_result/{task_id}")
     last_payload: Dict[str, Any] = {}
 
-    for i in range(max_tries):
+    for _ in range(max_tries):
         rr = session.get(task_url, timeout=120)
         rr.raise_for_status()
 
@@ -186,12 +194,10 @@ def _poll_task_result(task_id: str, max_tries: int = 20, sleep_s: float = 0.8) -
             if state in {"FAILURE", "FAILED", "ERROR"}:
                 raise RuntimeError(f"Tarea falló: {last_payload}")
 
-            # Si aún no está lista, seguimos consultando el endpoint final
             if result_ready is False or state in {"STARTED", "PENDING", "PROCESSING", "PROGRESS", ""}:
                 time.sleep(sleep_s)
                 continue
 
-            # Si backend dice ready pero aún no trae filas, devolvemos eso
             if result_ready is True:
                 return last_payload
 
@@ -229,15 +235,11 @@ def fetch_table_csv(
     r.raise_for_status()
     payload = r.json()
 
-    # Caso 1: respuesta directa con data
     if isinstance(payload, dict) and isinstance(payload.get("data"), list):
         final_payload = payload
-
-    # Caso 2: async -> siempre seguimos consultando el último endpoint task_result/<task_id>
     elif isinstance(payload, dict) and payload.get("task_id"):
         task_id = payload["task_id"]
-        final_payload = _poll_task_result(task_id=task_id, max_tries=20, sleep_s=0.8)
-
+        final_payload = _poll_task_result(task_id=task_id, max_tries=18, sleep_s=0.6)
     else:
         raise RuntimeError(f"Respuesta inicial inesperada: {str(payload)[:300]}")
 
@@ -252,32 +254,73 @@ def fetch_table_csv(
 
     df = pd.DataFrame(rows)
 
+    # --- FORZAR NOMBRES EXACTOS DE COLUMNAS ---
     rename_map = {
-        "fecha": "Date",
-        "date": "Date",
-        "Day": "Date",
-        "hora": "Time",
-        "time": "Time",
-        "Time": "Time",
-        "strikes": "Strikes",
-        "Strikes": "Strikes",
-        "type": "Type",
-        "Type": "Type",
-        "Option": "Option",
-        "credit": "Credit",
-        "Credit": "Credit",
-        "price": "Price",
-        "Price": "Price",
-        "close": "Close",
         "Close": "Close",
-        "result": "Result",
-        "P/L": "Result",
+        "close": "Close",
+
+        "Credit": "Credit",
+        "credit": "Credit",
+
+        "Day": "Day",
+        "Date": "Day",
+        "fecha": "Day",
+        "date": "Day",
+
         "Diff": "Diff",
-        "itmOtm": "ITM/OTM",
-        "movimiento_esperado": "Expected Move",
-        "score_30min": "Score 30min",
+        "diff": "Diff",
+
+        "Option": "Option",
+        "Type": "Option",
+        "type": "Option",
+
+        "P/L": "P/L",
+        "Result": "P/L",
+        "result": "P/L",
+
+        "Price": "Price",
+        "price": "Price",
+
+        "Strikes": "Strikes",
+        "strikes": "Strikes",
+
+        "Time": "Time",
+        "time": "Time",
+        "hora": "Time",
+
+        "itmOtm": "itmOtm",
+        "ITM/OTM": "itmOtm",
+        "itm_otm": "itmOtm",
+
+        "movimiento_esperado": "movimiento_esperado",
+        "Expected Move": "movimiento_esperado",
+        "expected_move": "movimiento_esperado",
+
+        "score_30min": "score_30min",
+        "Score 30min": "score_30min",
+        "score30min": "score_30min",
     }
+
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # Ordenar columnas si existen
+    desired_order = [
+        "Close",
+        "Credit",
+        "Day",
+        "Diff",
+        "Option",
+        "P/L",
+        "Price",
+        "Strikes",
+        "Time",
+        "itmOtm",
+        "movimiento_esperado",
+        "score_30min",
+    ]
+    ordered_existing = [c for c in desired_order if c in df.columns]
+    remaining = [c for c in df.columns if c not in ordered_existing]
+    df = df[ordered_existing + remaining]
 
     if clean_numeric:
         def clean_money(x):
@@ -286,7 +329,7 @@ def fetch_table_csv(
                 errors="coerce"
             )
 
-        for c in ["Credit", "Price", "Close", "Result", "Diff", "Expected Move", "Score 30min"]:
+        for c in ["Close", "Credit", "Diff", "P/L", "Price", "movimiento_esperado", "score_30min"]:
             if c in df.columns:
                 df[c] = df[c].map(clean_money)
 
